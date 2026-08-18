@@ -1581,12 +1581,31 @@ export function activate(context: vscode.ExtensionContext) {
     if (listItems.length > 0) {
       stream.markdown(`📋 **--list mode:** Resolving **${listItems.length}** item(s)…\n`);
       const listJiraCreds = await jiraStore.get();
-      prUrlsToProcess = await resolveListItems(listItems, listJiraCreds, stream);
+      const resolved = await resolveListItems(listItems, listJiraCreds, stream);
+
+      // Deduplicate — multiple Jira stories can link to the same PR.
+      // Normalise URLs (strip trailing slashes) before comparing.
+      const seen = new Set<string>();
+      const duplicates: string[] = [];
+      prUrlsToProcess = resolved.filter(url => {
+        const key = url.replace(/\/+$/, '').toLowerCase();
+        if (seen.has(key)) { duplicates.push(url); return false; }
+        seen.add(key);
+        return true;
+      });
+
+      if (duplicates.length > 0) {
+        stream.markdown(
+          `🔀 **${duplicates.length}** duplicate PR(s) removed — multiple stories linked to the same PR:\n` +
+          duplicates.map(u => `- \`${u}\``).join('\n') + '\n'
+        );
+      }
+
       if (prUrlsToProcess.length === 0) {
         stream.markdown('⚠️ No PR URLs could be resolved from the list. Nothing to generate.\n');
         return;
       }
-      stream.markdown(`\n✅ Resolved to **${prUrlsToProcess.length}** PR(s). Generating checklists…\n`);
+      stream.markdown(`\n✅ **${prUrlsToProcess.length}** unique PR(s) to process. Generating checklists…\n`);
     } else {
       prUrlsToProcess = prUrl ? [prUrl] : [];
     }
