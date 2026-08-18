@@ -1,8 +1,8 @@
 {
   "name": "code-review-checklist-agent",
   "displayName": "Code Review Checklist Agent",
-  "description": "Copilot Chat agent that auto-fills the PSSM2.0 code review checklist Excel from PR comments",
-  "version": "0.3.9",
+  "description": "PSSM2.0 Code Review Checklist Agent — conversational AI that generates, analyses and tracks code review checklists from GitHub PRs and Jira stories",
+  "version": "1.0.0",
   "engines": {
     "vscode": "^1.90.0"
   },

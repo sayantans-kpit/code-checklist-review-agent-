@@ -8,6 +8,64 @@ import ExcelJS from 'exceljs';
 const execAsync = util.promisify(cp.exec);
 
 // ─────────────────────────────────────────────────────────────────────────────
+// File reader — extracts PR URLs and Jira keys from any attached file
+// Supports: .xlsx, .csv, .txt, .md, .json
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface FileReadResult {
+  rawText:    string;    // full readable content for AI context
+  prUrls:     string[];  // GitHub PR URLs found
+  jiraKeys:   string[];  // Jira story keys found
+  allItems:   string[];  // everything that looks actionable
+}
+
+async function readAttachedFile(filePath: string): Promise<FileReadResult> {
+  const ext = path.extname(filePath).toLowerCase();
+  const PR_URL  = /https?:\/\/github\.com\/[^\s"',]+\/pull\/\d+/g;
+  const JIRA_K  = /\b([A-Z][A-Z0-9]+-\d+)\b/g;
+  const JIRA_URL = /atlassian\.net\/browse\/([A-Z][A-Z0-9]+-\d+)/g;
+
+  let rawText = '';
+
+  if (ext === '.xlsx' || ext === '.xls') {
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.readFile(filePath);
+    const lines: string[] = [];
+    wb.eachSheet(ws => {
+      ws.eachRow(row => {
+        const cells = (row.values as any[]).slice(1).map(v => v?.toString?.() ?? '').filter(Boolean);
+        if (cells.length) { lines.push(cells.join('\t')); }
+      });
+    });
+    rawText = lines.join('\n');
+
+  } else if (ext === '.csv') {
+    rawText = fs.readFileSync(filePath, 'utf8');
+
+  } else if (['.txt', '.md', '.json'].includes(ext)) {
+    rawText = fs.readFileSync(filePath, 'utf8');
+    if (ext === '.json') {
+      try {
+        const parsed = JSON.parse(rawText);
+        rawText = JSON.stringify(parsed, null, 2);
+      } catch { /* keep raw */ }
+    }
+  } else {
+    // Try reading as text anyway
+    try { rawText = fs.readFileSync(filePath, 'utf8'); } catch { rawText = ''; }
+  }
+
+  const prUrls   = [...new Set([...rawText.matchAll(PR_URL)].map(m => m[0]))];
+  const jiraKeys = [...new Set([
+    ...[...rawText.matchAll(JIRA_K)].map(m => m[1]),
+    ...[...rawText.matchAll(JIRA_URL)].map(m => m[1]),
+  ])];
+  const allItems = [...prUrls, ...jiraKeys.filter(k => !prUrls.some(u => u.includes(k)))];
+
+  return { rawText: rawText.slice(0, 8000), prUrls, jiraKeys, allItems };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Checklist rows — PSSM2.0 template (rows 10-34)
 // ─────────────────────────────────────────────────────────────────────────────
 interface ChecklistRow {
@@ -1138,6 +1196,83 @@ class TokenStore {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Free-form conversational handler
+// Answers any question using checklist knowledge + session context + history
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function handleConversation(
+  question: string,
+  attachedFileContent: string,
+  workspaceRoot: string,
+  model: vscode.LanguageModelChat,
+  token: vscode.CancellationToken,
+  stream: vscode.ChatResponseStream
+): Promise<void> {
+
+  // Load last run context
+  const ctxPath = path.join(workspaceRoot, 'code-review', '.context.md');
+  const lastContext = fs.existsSync(ctxPath)
+    ? fs.readFileSync(ctxPath, 'utf8').slice(0, 6000)
+    : '(No previous review context found. Run @checklist /generate first.)';
+
+  // Load review history summary from index.json
+  const indexPath = path.join(workspaceRoot, 'code-review', 'index.json');
+  let historySummary = '(No review history yet.)';
+  if (fs.existsSync(indexPath)) {
+    try {
+      const idx = JSON.parse(fs.readFileSync(indexPath, 'utf8')) as Record<string, any[]>;
+      const entries = Object.entries(idx);
+      if (entries.length > 0) {
+        historySummary = entries.map(([prKey, versions]) => {
+          const last = versions[versions.length - 1];
+          return `- ${prKey}: ${versions.length} version(s), last: v${last.version} on ${last.date} (${last.notOkCount} Not Ok)`;
+        }).join('\n');
+      }
+    } catch { /* ignore */ }
+  }
+
+  const checklistRules = CHECKLIST_ROWS
+    .map(r => `Row ${r.id} [${r.reviewArea}] — ${r.checkCategory}: ${r.description}`)
+    .join('\n');
+
+  const systemMsg = `You are the Code Review Checklist Agent for the PSSM2.0 project at Decisiv.
+
+You have deep knowledge of the 25-row PSSM2.0 source code review checklist. You help developers:
+- Understand checklist rules and how to apply them
+- Analyse code review findings and suggest fixes
+- Navigate review history and track progress
+- Answer questions about past reviews, sprint status, or defect patterns
+- Process files (Excel, CSV, text) containing PR lists or review data
+
+## The 25-Row PSSM2.0 Checklist
+${checklistRules}
+
+## Last Review Session Context
+${lastContext}
+
+## Review History
+${historySummary}
+
+Answer the user's question helpfully and concisely. 
+If they're asking about code fixes, reference the specific diff from the context above.
+If they give you a file, extract actionable items and explain what you found.`;
+
+  const userMsg = attachedFileContent
+    ? `${question}\n\n## Attached file content:\n${attachedFileContent}`
+    : question;
+
+  const messages = [
+    vscode.LanguageModelChatMessage.User(systemMsg),
+    vscode.LanguageModelChatMessage.User(userMsg),
+  ];
+
+  const response = await model.sendRequest(messages, {}, token);
+  for await (const chunk of response.text) {
+    stream.markdown(chunk);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Extension entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1309,12 +1444,80 @@ export function activate(context: vscode.ExtensionContext) {
       return;
     }
 
+    // ── Process file attachments (drag-and-drop from VS Code) ─────────────
+    // Collect all file URIs from request.references
+    const attachedFiles: string[] = [];
+    let   attachedFileContent = '';
+
+    for (const ref of request.references) {
+      if (ref.value instanceof vscode.Uri && ref.value.scheme === 'file') {
+        attachedFiles.push(ref.value.fsPath);
+      }
+    }
+
+    // Read all attached files and aggregate content
+    let fileItems: string[] = [];
+    if (attachedFiles.length > 0) {
+      stream.markdown(`📎 Reading **${attachedFiles.length}** attached file(s)…\n`);
+      for (const fp of attachedFiles) {
+        try {
+          const result = await readAttachedFile(fp);
+          attachedFileContent += `\n### File: ${path.basename(fp)}\n${result.rawText}\n`;
+          fileItems.push(...result.allItems);
+
+          if (result.allItems.length > 0) {
+            stream.markdown(
+              `✅ \`${path.basename(fp)}\` → found **${result.prUrls.length}** PR URL(s) + **${result.jiraKeys.length}** Jira key(s)\n`
+            );
+          } else {
+            stream.markdown(`📄 \`${path.basename(fp)}\` → added as context (no PR/Jira items found)\n`);
+          }
+        } catch (err: any) {
+          stream.markdown(`⚠️ Could not read \`${path.basename(fp)}\`: ${err.message}\n`);
+        }
+      }
+      fileItems = [...new Set(fileItems)];
+    }
+
+    // ── Route: if files have PR/Jira items → auto-trigger --list mode ──────
+    // Inject file items into the prompt as --list items
+    const promptWithFileItems = fileItems.length > 0
+      ? (request.prompt + ` --list ${fileItems.join(' ')}`).trim()
+      : request.prompt;
+
+    // ── Conversational mode — any non-command message ─────────────────────
     if (request.command !== 'generate') {
-      stream.markdown('Unknown command. Try `@checklist /help`.');
-      return;
+      const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.env.HOME ?? '/tmp';
+
+      // If files had actionable items and no explicit command → treat as /generate --list
+      if (fileItems.length > 0) {
+        stream.markdown(`🔄 Found **${fileItems.length}** item(s) in file(s). Running checklist generation…\n`);
+        // Fall through to generate with modified prompt by not returning here
+        // We'll handle this by pretending the user ran /generate --list <items>
+      } else {
+        // Pure conversational question — answer using checklist knowledge + context
+        let model: vscode.LanguageModelChat | undefined;
+        for (const family of ['claude-sonnet', 'gpt-4o', 'gpt-4', 'default']) {
+          const candidates = await vscode.lm.selectChatModels({ family });
+          if (candidates.length) { model = candidates[0]; break; }
+        }
+        if (!model) {
+          const all = await vscode.lm.selectChatModels({});
+          model = all[0];
+        }
+        if (!model) {
+          stream.markdown('⚠️ No AI model available. Ensure GitHub Copilot Chat is active.');
+          return;
+        }
+
+        const userQuestion = request.prompt.trim() || 'Tell me about the last code review.';
+        await handleConversation(userQuestion, attachedFileContent, workspaceRoot, model, token, stream);
+        return;
+      }
     }
     // ── Parse arguments ────────────────────────────────────────────────────
-    const prompt = request.prompt.trim();
+    // Use promptWithFileItems when files were attached (injects --list items from files)
+    const prompt = promptWithFileItems.trim();
     const tokenMatch = prompt.match(/--token\s+(\S+)/);
     // Use inline --token if given, otherwise load from secure storage
     const inlineToken = tokenMatch ? tokenMatch[1] : null;
