@@ -1567,8 +1567,16 @@ export function activate(context: vscode.ExtensionContext) {
       .trim();
     const pastedComments = cleanPrompt ? cleanPrompt.split('\n').map(l => l.trim()).filter(Boolean) : [];
 
-    if (!prUrl && !manualBranch && listItems.length === 0) {
-      stream.markdown('⚠️ Please provide a PR URL, `--branch <name>`, or `--list <items>`.\n\n' + HELP_TEXT);
+    // If --jira keys given without a PR URL → treat them as --list items
+    // so the agent resolves the linked PR automatically from Jira dev-info.
+    const effectiveListItems = listItems.length > 0
+      ? listItems
+      : (!prUrl && !manualBranch && jiraOverrides.length > 0)
+        ? jiraOverrides
+        : listItems;
+
+    if (!prUrl && !manualBranch && effectiveListItems.length === 0) {
+      stream.markdown('⚠️ Please provide a PR URL, `--branch <name>`, `--jira <key>`, or `--list <items>`.\n\n' + HELP_TEXT);
       return;
     }
 
@@ -1578,10 +1586,14 @@ export function activate(context: vscode.ExtensionContext) {
 
     // ── Resolve --list items to PR URLs ────────────────────────────────────
     let prUrlsToProcess: string[] = [];
-    if (listItems.length > 0) {
-      stream.markdown(`📋 **--list mode:** Resolving **${listItems.length}** item(s)…\n`);
+    if (effectiveListItems.length > 0) {
+      const isJiraFallback = listItems.length === 0 && effectiveListItems === jiraOverrides;
+      const label = isJiraFallback
+        ? `🔗 No PR URL given — resolving PR from Jira story **${effectiveListItems.join(', ')}**…\n`
+        : `📋 **--list mode:** Resolving **${effectiveListItems.length}** item(s)…\n`;
+      stream.markdown(label);
       const listJiraCreds = await jiraStore.get();
-      const resolved = await resolveListItems(listItems, listJiraCreds, stream);
+      const resolved = await resolveListItems(effectiveListItems, listJiraCreds, stream);
 
       // Deduplicate — multiple Jira stories can link to the same PR.
       // Normalise URLs (strip trailing slashes) before comparing.
