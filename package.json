@@ -1,8 +1,8 @@
 {
   "name": "code-review-checklist-agent",
   "displayName": "Code Review Checklist Agent",
-  "description": "PSSM2.0 Code Review Checklist Agent — conversational AI that generates, analyses and tracks code review checklists from GitHub PRs and Jira stories",
-  "version": "1.0.3",
+  "description": "PSSM2.0 Code Review Checklist Agent \u2014 conversational AI that generates, analyses and tracks code review checklists from GitHub PRs and Jira stories",
+  "version": "1.0.4",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -17,19 +17,19 @@
   "contributes": {
     "chatParticipants": [
       {
-        "id": "checklist.agent",
+        "id": "decisiv-pssm.code-review",
         "fullName": "Code Review Checklist",
-        "name": "checklist",
+        "name": "code-review",
         "description": "Generates a filled PSSM2.0 code review checklist Excel from PR comments",
         "isSticky": true,
         "commands": [
           {
             "name": "generate",
-            "description": "Generate a filled checklist Excel for a PR. Usage: @checklist /generate <PR_URL>"
+            "description": "Generate a filled checklist Excel for a PR. Usage: @code-review /generate <PR_URL>"
           },
           {
             "name": "token",
-            "description": "Save, check, or clear your GitHub PAT. Usage: @checklist /token <PAT> | status | clear"
+            "description": "Save, check, or clear your GitHub PAT. Usage: @code-review /token <PAT> | status | clear"
           },
           {
             "name": "help",
@@ -37,15 +37,15 @@
           },
           {
             "name": "history",
-            "description": "Show all checklist versions for a PR. Usage: @checklist /history <PR_URL>"
+            "description": "Show all checklist versions for a PR. Usage: @code-review /history <PR_URL>"
           },
           {
             "name": "jira",
-            "description": "Save Jira credentials. Usage: @checklist /jira <email> <token> | status | clear"
+            "description": "Save Jira credentials. Usage: @code-review /jira <email> <token> | status | clear"
           },
           {
             "name": "list",
-            "description": "Batch mode: resolve Jira keys/PR URLs and generate checklists. Usage: @checklist /generate --list SRM2-1234 SRM2-5678 https://github.com/org/repo/pull/42"
+            "description": "Batch mode: resolve Jira keys/PR URLs and generate checklists. Usage: @code-review /generate --list SRM2-1234 SRM2-5678 https://github.com/org/repo/pull/42"
           }
         ]
       }

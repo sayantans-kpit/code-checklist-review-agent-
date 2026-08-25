@@ -222,7 +222,7 @@ async function fetchFromGitHub(prUrl: string, token: string): Promise<PRData> {
 
   if (!prRes.ok) {
     const body = await prRes.text();
-    const hint = prRes.status === 401 ? ' — PAT expired or invalid. Run @checklist /token to update.' :
+    const hint = prRes.status === 401 ? ' — PAT expired or invalid. Run @code-review /token to update.' :
                  prRes.status === 403 ? ' — PAT lacks "repo" scope or rate limited.' :
                  prRes.status === 404 ? ' — PR not found. Check URL and repo access.' : '';
     throw new Error(`GitHub API ${prRes.status}${hint}: ${body.slice(0, 200)}`);
@@ -586,12 +586,12 @@ class ContextWriter {
     const ctxLines = Object.entries(ctx).map(([k, v]) => `- ${k}: ${v}`);
     const msg = err?.message ?? String(err);
     const hints = [
-      msg.includes('401')       ? '- GitHub PAT expired → run `@checklist /token <new_PAT>`' : '',
+      msg.includes('401')       ? '- GitHub PAT expired → run `@code-review /token <new_PAT>`' : '',
       msg.includes('403')       ? '- PAT missing `repo` scope → regenerate at https://github.com/settings/tokens' : '',
       msg.includes('ENOTFOUND') ? '- DNS failed → check VPN / internet connection' : '',
       msg.includes('timed out') ? '- Request timed out → check network, try again' : '',
       msg.includes('CERT')      ? '- SSL cert error → corporate proxy may intercept HTTPS' : '',
-      msg.includes('Jira')      ? '- Check Jira credentials → `@checklist /jira status`' : '',
+      msg.includes('Jira')      ? '- Check Jira credentials → `@code-review /jira status`' : '',
     ].filter(Boolean);
 
     this.sections.push(
@@ -1130,7 +1130,7 @@ async function resolveListItems(
     if (JIRA_KEY.test(item.toUpperCase())) {
       const key = item.toUpperCase();
       if (!creds) {
-        stream.markdown(`⚠️ **${key}** — Jira credentials not set. Use \`@checklist /jira\` to save them.\n`);
+        stream.markdown(`⚠️ **${key}** — Jira credentials not set. Use \`@code-review /jira\` to save them.\n`);
         continue;
       }
 
@@ -1221,7 +1221,7 @@ async function handleConversation(
   const ctxPath = path.join(workspaceRoot, 'code-review', '.context.md');
   const lastContext = fs.existsSync(ctxPath)
     ? fs.readFileSync(ctxPath, 'utf8').slice(0, 6000)
-    : '(No previous review context found. Run @checklist /generate first.)';
+    : '(No previous review context found. Run @code-review /generate first.)';
 
   // Load review history summary from index.json
   const indexPath = path.join(workspaceRoot, 'code-review', 'index.json');
@@ -1289,7 +1289,7 @@ export function activate(context: vscode.ExtensionContext) {
   const tokenStore = new TokenStore(context.secrets);
   const jiraStore  = new JiraStore(context.secrets);
 
-  const participant = vscode.chat.createChatParticipant('checklist.agent', async (
+  const participant = vscode.chat.createChatParticipant('decisiv-pssm.code-review', async (
     request: vscode.ChatRequest,
     _ctx: vscode.ChatContext,
     stream: vscode.ChatResponseStream,
@@ -1315,9 +1315,9 @@ export function activate(context: vscode.ExtensionContext) {
       if (arg === 'status' || arg === 'check') {
         const existing = await tokenStore.get();
         if (existing) {
-          stream.markdown(`✅ A GitHub PAT is stored (ends in \`…${existing.slice(-4)}\`).\nUse \`@checklist /token clear\` to remove it.`);
+          stream.markdown(`✅ A GitHub PAT is stored (ends in \`…${existing.slice(-4)}\`).\nUse \`@code-review /token clear\` to remove it.`);
         } else {
-          stream.markdown('ℹ️ No GitHub PAT stored yet.\nUse `@checklist /token <YOUR_PAT>` to save one.');
+          stream.markdown('ℹ️ No GitHub PAT stored yet.\nUse `@code-review /token <YOUR_PAT>` to save one.');
         }
         return;
       }
@@ -1342,7 +1342,7 @@ export function activate(context: vscode.ExtensionContext) {
           '',
           'From now on, just use:',
           '```',
-          '@checklist /generate https://github.com/org/repo/pull/42',
+          '@code-review /generate https://github.com/org/repo/pull/42',
           '```',
           'No `--token` flag needed anymore.',
         ].join('\n'));
@@ -1353,12 +1353,12 @@ export function activate(context: vscode.ExtensionContext) {
       stream.markdown([
         '## Save your GitHub PAT\n',
         '```',
-        '@checklist /token <YOUR_GITHUB_PAT>',
+        '@code-review /token <YOUR_GITHUB_PAT>',
         '```',
         '',
         '**Other commands:**',
-        '- `@checklist /token status` — check if a PAT is stored',
-        '- `@checklist /token clear` — remove the stored PAT',
+        '- `@code-review /token status` — check if a PAT is stored',
+        '- `@code-review /token clear` — remove the stored PAT',
         '',
         '**Generate a PAT:** https://github.com/settings/tokens',
         'Required scopes: `repo`',
@@ -1379,11 +1379,11 @@ export function activate(context: vscode.ExtensionContext) {
       if (arg === 'status' || arg === 'check') {
         const creds = await jiraStore.get();
         if (creds) {
-          stream.markdown(`✅ Jira credentials stored for **${creds.email}**.\nUse \`@checklist /jira clear\` to remove.`);
+          stream.markdown(`✅ Jira credentials stored for **${creds.email}**.\nUse \`@code-review /jira clear\` to remove.`);
         } else {
           stream.markdown([
             'ℹ️ No Jira credentials stored yet.',
-            'Usage: `@checklist /jira <your@email.com> <ATLASSIAN_API_TOKEN>`',
+            'Usage: `@code-review /jira <your@email.com> <ATLASSIAN_API_TOKEN>`',
             'Generate a token at: https://id.atlassian.net/manage-profile/security/api-tokens',
           ].join('\n'));
         }
@@ -1412,14 +1412,14 @@ export function activate(context: vscode.ExtensionContext) {
       stream.markdown([
         '## Save Jira credentials\n',
         '```',
-        '@checklist /jira your@email.com ATLASSIAN_API_TOKEN',
+        '@code-review /jira your@email.com ATLASSIAN_API_TOKEN',
         '```',
         '',
         'Generate an API token at: https://id.atlassian.net/manage-profile/security/api-tokens',
         '',
         '**Other commands:**',
-        '- `@checklist /jira status` — check stored credentials',
-        '- `@checklist /jira clear` — remove credentials',
+        '- `@code-review /jira status` — check stored credentials',
+        '- `@code-review /jira clear` — remove credentials',
       ].join('\n'));
       return;
     }
@@ -1428,7 +1428,7 @@ export function activate(context: vscode.ExtensionContext) {
     if (request.command === 'history') {
       const prKey = request.prompt.trim();
       if (!prKey) {
-        stream.markdown('Usage: `@checklist /history <PR_URL_or_branch>`');
+        stream.markdown('Usage: `@code-review /history <PR_URL_or_branch>`');
         return;
       }
       const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.env.HOME ?? '/tmp';
@@ -1686,7 +1686,7 @@ export function activate(context: vscode.ExtensionContext) {
         ctxWriter.addError('GitHub API Failed', err, {
           'PR URL': prUrl ?? '',
           'PAT set': githubToken ? 'yes' : 'no',
-          'Hint': 'Run @checklist /token to update PAT, or check VPN/network',
+          'Hint': 'Run @code-review /token to update PAT, or check VPN/network',
         });
         stream.markdown(`❌ GitHub API failed: ${err.message}\n`);
         stream.reference(ctxWriter.uri);
@@ -1733,7 +1733,7 @@ export function activate(context: vscode.ExtensionContext) {
         stream.markdown([
           '📝 **Please paste PR review comments below the URL:**\n',
           '```',
-          '@checklist /generate https://github.com/org/repo/pull/42',
+          '@code-review /generate https://github.com/org/repo/pull/42',
           '1. Missing error handling in UserController#update',
           '2. N+1 query in app/views/users/index line 34',
           '```',
@@ -1786,7 +1786,7 @@ export function activate(context: vscode.ExtensionContext) {
         );
       });
     } else if (!jiraCreds && detectedKeys.length > 0) {
-      stream.markdown(`ℹ️ Jira keys detected but no credentials saved — keys will be listed in the Excel.\nRun \`@checklist /jira your@email.com TOKEN\` to enable full story fetch.\n`);
+      stream.markdown(`ℹ️ Jira keys detected but no credentials saved — keys will be listed in the Excel.\nRun \`@code-review /jira your@email.com TOKEN\` to enable full story fetch.\n`);
     } else if (detectedKeys.length === 0) {
       stream.markdown(`ℹ️ No Jira ticket detected in branch, title, or PR description.\nUse \`--jira SRM2-XXXX SRM2-YYYY\` to specify manually.\n`);
     }
@@ -2005,8 +2005,8 @@ export function activate(context: vscode.ExtensionContext) {
       `**What to do next:**`,
       `- Fill in **Reviewer(s)** name (C7) if not auto-filled`,
       `- Review AI-filled findings (col G) and adjust if needed`,
-      `- After re-review, run \`@checklist /generate\` again — it will create **v${version + 1}**`,
-      `- \`@checklist /history ${prData.url || prData.branch}\` to see all versions`,
+      `- After re-review, run \`@code-review /generate\` again — it will create **v${version + 1}**`,
+      `- \`@code-review /history ${prData.url || prData.branch}\` to see all versions`,
     ].join('\n'));
 
     // Write final context and surface it in chat via stream.reference()
@@ -2057,7 +2057,7 @@ PSSM2.0 Excel checklist template — ready to share with stakeholders in seconds
 
 ### 🔑 First time only — save your GitHub PAT
 \`\`\`
-@checklist /token ghp_xxxxxxxxxxxxxxxxxxxx
+@code-review /token ghp_xxxxxxxxxxxxxxxxxxxx
 \`\`\`
 Stored in VS Code's encrypted OS keychain. Never typed again.
 *(Generate at: https://github.com/settings/tokens — scope: **repo**)*
@@ -2068,19 +2068,19 @@ Stored in VS Code's encrypted OS keychain. Never typed again.
 
 **Option 1 · GitHub API (recommended)**
 \`\`\`
-@checklist /generate https://github.com/org/repo/pull/42
+@code-review /generate https://github.com/org/repo/pull/42
 \`\`\`
 Auto-fetches: code diff · PR comments · assignees · reviewers · dates
 
 **Option 2 · Local git diff**
 \`\`\`
-@checklist /generate --branch feature/my-branch --base main
+@code-review /generate --branch feature/my-branch --base main
 \`\`\`
 Reads diff from your open repo. Paste review comments below (optional).
 
 **Option 3 · Manual comments**
 \`\`\`
-@checklist /generate https://github.com/org/repo/pull/42
+@code-review /generate https://github.com/org/repo/pull/42
 Missing error handling in UserController
 N+1 query in users/index line 34
 \`\`\`
@@ -2090,7 +2090,7 @@ N+1 query in users/index line 34
 ### 💡 Prompt: — guide the AI with your specification
 Add context on any new line after the command:
 \`\`\`
-@checklist /generate https://github.com/org/repo/pull/42
+@code-review /generate https://github.com/org/repo/pull/42
 Prompt: Backend-only Rails PR — no React changes.
         Performance is top priority, 10k+ cases in prod.
         i18n skipped this sprint — mark those rows NA.
