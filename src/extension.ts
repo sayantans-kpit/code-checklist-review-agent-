@@ -694,17 +694,30 @@ async function generateExcel(
   detectedJiraKeys: string[]
 ): Promise<void> {
 
-  // xlsx-populate loads the xlsx as a zip and modifies only the XML nodes
-  // for cells you touch — leaving all other structure (styles, merges, formulas,
-  // defined names, print settings) exactly as in the original template.
-  // This is why Windows Excel / Mac Excel / SharePoint all render it correctly.
   // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const XlsxPopulate = require('xlsx-populate');
-  const wb  = await XlsxPopulate.fromFileAsync(templatePath);
-  const ws  = wb.sheet('ROR');
+  const XLSX = require('xlsx');
+
+  // Read template — cellStyles:true preserves all formatting, fills, borders, merges
+  const wb = XLSX.readFile(templatePath, { cellStyles: true, cellFormula: true, bookVBA: false });
+  const ws = wb.Sheets['ROR'];
   if (!ws) { throw new Error('Sheet "ROR" not found in template'); }
 
   const today = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+
+  /** Set a cell value, preserving its existing style from the template */
+  function setVal(addr: string, val: string | number | null): void {
+    if (val === null || val === undefined || val === '') { return; }
+    const existing = ws[addr];
+    if (existing) {
+      // Update value only — keep style, formula references, etc.
+      existing.v = val;
+      existing.t = typeof val === 'number' ? 'n' : 's';
+      delete existing.f;   // remove formula — we're writing a computed value
+      delete existing.w;   // remove cached formatted text so Excel recalculates
+    } else {
+      ws[addr] = { t: typeof val === 'number' ? 'n' : 's', v: val };
+    }
+  }
 
   // ── Fill header cells ─────────────────────────────────────────────────────
   const keyBrackets = (jiraStories.length > 0
@@ -712,21 +725,18 @@ async function generateExcel(
     : detectedJiraKeys
   ).map((k: string) => `[${k}]`).join(' ');
 
-  ws.cell('C4').value(keyBrackets ? `${prData.url} ${keyBrackets}` : prData.url);
-  ws.cell('C5').value(`v${version}`);
+  setVal('C4', keyBrackets ? `${prData.url} ${keyBrackets}` : prData.url);
+  setVal('C5', `v${version}`);
 
   const authorVal = prData.assignees.length ? prData.assignees.join(', ') : prData.author;
-  if (authorVal) { ws.cell('C6').value(authorVal); }
+  if (authorVal) { setVal('C6', authorVal); }
+  if (prData.reviewers.length) { setVal('C7', `SME - ${prData.reviewers.join(', ')}`); }
 
-  if (prData.reviewers.length) {
-    ws.cell('C7').value(`SME - ${prData.reviewers.join(', ')}`);
-  }
-
-  ws.cell('C8').value(fmtDate(prData.createdAt) ?? today);
+  setVal('C8', fmtDate(prData.createdAt) ?? today);
   const endDate = fmtDate(prData.closedAt);
-  if (endDate) { ws.cell('C9').value(endDate); }
+  if (endDate) { setVal('C9', endDate); }
 
-  // ── Fill checklist rows 11-35 ─────────────────────────────────────────────
+  // ── Fill checklist rows 11-35 (cols E, F, G, H, I) ───────────────────────
   const findingMap = new Map<number, RowFinding>();
   findings.forEach(f => findingMap.set(f.rowId, f));
 
@@ -734,89 +744,75 @@ async function generateExcel(
     const rowNum = rowId + 10;
     const f = findingMap.get(rowId);
     if (!f) { continue; }
-
-    ws.cell(`E${rowNum}`).value(f.authorStatus);
-
-    ws.cell(`F${rowNum}`).value(f.reviewerStatus);
-    // Colour the reviewer status cell
-    const fillColor = f.reviewerStatus === 'Not Ok' ? 'FCE4D6'
-                    : f.reviewerStatus === 'Ok'     ? 'E2EFDA'
-                    : 'FFFF2CC';
-    ws.cell(`F${rowNum}`).style('fill', fillColor);
-
-    ws.cell(`G${rowNum}`).value(f.finding);
-    ws.cell(`H${rowNum}`).value(f.defectType);
-    ws.cell(`I${rowNum}`).value(f.remarks);
+    setVal(`E${rowNum}`, f.authorStatus);
+    setVal(`F${rowNum}`, f.reviewerStatus);
+    setVal(`G${rowNum}`, f.finding);
+    setVal(`H${rowNum}`, f.defectType);
+    setVal(`I${rowNum}`, f.remarks);
   }
 
-  // ── Pre-compute summary counts (no formula cache issues) ──────────────────
+  // ── Pre-compute summary counts (bypasses stale formula cache) ─────────────
   const countE = (v: string) => findings.filter(f => f.authorStatus   === v).length;
   const countF = (v: string) => findings.filter(f => f.reviewerStatus === v).length;
   const countH = (v: string) => findings.filter(f => f.defectType     === v).length;
 
-  ws.cell('J4').value(countE('Yes'));
-  ws.cell('J5').value(countE('No'));
-  ws.cell('J6').value(countE('NA'));
-  ws.cell('J8').value(countF('Ok'));
-  ws.cell('J9').value(countF('Not Ok'));
-  ws.cell('H3').value(countH('Functional'));
-  ws.cell('H4').value(countH('Technical'));
-  ws.cell('H5').value(countH('Process/Compliance'));
-  ws.cell('H6').value(countH('Documentation'));
-  ws.cell('H7').value(countH('Others'));
-  ws.cell('H9').value(findings.filter(f => f.defectType !== '').length);
+  setVal('J4', countE('Yes'));     setVal('J5', countE('No'));    setVal('J6', countE('NA'));
+  setVal('J8', countF('Ok'));      setVal('J9', countF('Not Ok'));
+  setVal('H3', countH('Functional'));   setVal('H4', countH('Technical'));
+  setVal('H5', countH('Process/Compliance'));
+  setVal('H6', countH('Documentation')); setVal('H7', countH('Others'));
+  setVal('H9', findings.filter(f => f.defectType !== '').length);
 
   // ── Re-review Required sheet ──────────────────────────────────────────────
   const notOkFindings = findings.filter(f => f.reviewerStatus === 'Not Ok');
   if (notOkFindings.length > 0) {
-    const rrSheet = wb.addSheet('Re-review Required');
-    const rrHeaders = ['#', 'Review Area', 'Description of Finding', 'Defect Type', 'Remarks / Action Required', 'Re-review Status'];
-    rrHeaders.forEach((h, i) => {
-      const col = String.fromCharCode(65 + i);
-      rrSheet.cell(`${col}1`).value(h)
-        .style({ bold: true, fontColor: 'FFFFFF', fill: 'C00000', horizontalAlignment: 'center' });
-    });
-
-    notOkFindings.forEach((f, idx) => {
-      const row  = idx + 2;
-      const fill = idx % 2 === 0 ? 'FFF2CC' : 'FCE4D6';
-      const area = CHECKLIST_ROWS.find(r => r.id === f.rowId)?.reviewArea ?? '';
-      [f.rowId, area, f.finding, f.defectType, f.remarks, ''].forEach((val, i) => {
-        rrSheet.cell(`${String.fromCharCode(65 + i)}${row}`)
-          .value(val)
-          .style({ fill, wrapText: true });
-      });
-    });
+    const rrData: any[][] = [
+      ['#', 'Review Area', 'Description of Finding', 'Defect Type', 'Suggested Action', 'Re-review Status'],
+      ...notOkFindings.map(f => [
+        f.rowId,
+        CHECKLIST_ROWS.find(r => r.id === f.rowId)?.reviewArea ?? '',
+        f.finding,
+        f.defectType,
+        f.remarks,
+        '',
+      ]),
+    ];
+    const rrSheet = XLSX.utils.aoa_to_sheet(rrData);
+    rrSheet['!cols'] = [5, 28, 60, 22, 50, 18].map(w => ({ wch: w }));
+    XLSX.utils.book_append_sheet(wb, rrSheet, 'Re-review Required');
   }
 
   // ── Version History sheet ─────────────────────────────────────────────────
-  const histSheet = wb.addSheet('Version History');
-  const histHeaders = ['Version', 'Date', 'Not Ok', 'Ok', 'NA', 'Comments'];
-  histHeaders.forEach((h, i) => {
-    histSheet.cell(`${String.fromCharCode(65 + i)}1`).value(h)
-      .style({ bold: true, fontColor: 'FFFFFF', fill: '1F3864' });
+  const histData: any[][] = [
+    ['Version', 'Date', 'Not Ok', 'Ok', 'NA', 'Comments'],
+    ...previousVersions.map((v: IndexEntry) => [
+      `v${v.version}`, v.date, v.notOkCount, v.okCount, 0, '',
+    ]),
+    [
+      `v${version} (current)`,
+      new Date().toISOString().slice(0, 10),
+      notOkFindings.length,
+      countF('Ok'),
+      findings.filter(f => f.reviewerStatus === 'NA').length,
+      '',
+    ],
+  ];
+  const histSheet = XLSX.utils.aoa_to_sheet(histData);
+  histSheet['!cols'] = [16, 14, 10, 10, 10, 60].map(w => ({ wch: w }));
+  XLSX.utils.book_append_sheet(wb, histSheet, 'Version History');
+
+  // ── Set ROR as the active tab ─────────────────────────────────────────────
+  if (!wb.Workbook) { wb.Workbook = {}; }
+  if (!wb.Workbook.Views) { wb.Workbook.Views = [{}]; }
+  wb.Workbook.Views[0].RTL    = false;
+  wb.Workbook.Views[0].ActiveTab = 0;  // ROR is always index 0
+
+  // ── Write with maximum Windows/Mac/SharePoint compatibility ───────────────
+  XLSX.writeFile(wb, outputPath, {
+    bookSST:     true,   // shared string table — required by Windows Excel
+    compression: true,   // deflate compression
+    bookType:    'xlsx',
   });
-
-  previousVersions.forEach((v: IndexEntry, idx: number) => {
-    const row = idx + 2;
-    [v.version ? `v${v.version}` : '', v.date, v.notOkCount, v.okCount, 0, ''].forEach((val, i) => {
-      histSheet.cell(`${String.fromCharCode(65 + i)}${row}`).value(val);
-    });
-  });
-
-  const curRow = previousVersions.length + 2;
-  [`v${version} (current)`, new Date().toISOString().slice(0, 10),
-   notOkFindings.length, countF('Ok'), findings.filter(f => f.reviewerStatus === 'NA').length, ''
-  ].forEach((val, i) => {
-    histSheet.cell(`${String.fromCharCode(65 + i)}${curRow}`)
-      .value(val)
-      .style({ fill: 'FFF2CC', bold: i === 0 });
-  });
-
-  // ── Set ROR as active tab ─────────────────────────────────────────────────
-  wb.activeSheet(ws);
-
-  await wb.toFileAsync(outputPath);
 }
 
 
