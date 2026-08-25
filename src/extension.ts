@@ -691,228 +691,132 @@ async function generateExcel(
   version: number,
   previousVersions: IndexEntry[],
   jiraStories: JiraStory[],
-  detectedJiraKeys: string[]       // keys always shown in C4, even without credentials
+  detectedJiraKeys: string[]
 ): Promise<void> {
-  // Load the original template — preserves all fonts, colours, merges, formulas
-  const wb = new ExcelJS.Workbook();
-  await wb.xlsx.readFile(templatePath);
 
-  const ws = wb.getWorksheet('ROR');
-  if (!ws) { throw new Error('Sheet "ROR" not found in template file.'); }
+  // xlsx-populate loads the xlsx as a zip and modifies only the XML nodes
+  // for cells you touch — leaving all other structure (styles, merges, formulas,
+  // defined names, print settings) exactly as in the original template.
+  // This is why Windows Excel / Mac Excel / SharePoint all render it correctly.
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const XlsxPopulate = require('xlsx-populate');
+  const wb  = await XlsxPopulate.fromFileAsync(templatePath);
+  const ws  = wb.sheet('ROR');
+  if (!ws) { throw new Error('Sheet "ROR" not found in template'); }
 
   const today = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
 
-  // ── Fill header metadata ──────────────────────────────────────────────────
-  // C4 = PR URL followed by all Jira keys in brackets on one line
-  //   e.g.  https://github.com/.../pull/20320 [SRM2-2089] [SRM2-2073]
+  // ── Fill header cells ─────────────────────────────────────────────────────
   const keyBrackets = (jiraStories.length > 0
-    ? jiraStories.map(s => s.key)
+    ? jiraStories.map((s: any) => s.key)
     : detectedJiraKeys
-  ).map(k => `[${k}]`).join(' ');
+  ).map((k: string) => `[${k}]`).join(' ');
 
-  ws.getCell('C4').value = keyBrackets
-    ? `${prData.url} ${keyBrackets}`
-    : prData.url;
-  ws.getCell('C5').value = `v${version}`;
-  // C6 = Assignee(s) — falls back to PR opener if no assignees set
-  const authorCell = prData.assignees.length
-    ? prData.assignees.join(', ')
-    : prData.author || undefined;
-  if (authorCell) { ws.getCell('C6').value = authorCell; }
+  ws.cell('C4').value(keyBrackets ? `${prData.url} ${keyBrackets}` : prData.url);
+  ws.cell('C5').value(`v${version}`);
+
+  const authorVal = prData.assignees.length ? prData.assignees.join(', ') : prData.author;
+  if (authorVal) { ws.cell('C6').value(authorVal); }
+
   if (prData.reviewers.length) {
-    ws.getCell('C7').value = `SME - ${prData.reviewers.join(', ')}`;
+    ws.cell('C7').value(`SME - ${prData.reviewers.join(', ')}`);
   }
-  // C8 = Start Date: PR raised date (falls back to today for local/manual mode)
-  ws.getCell('C8').value = fmtDate(prData.createdAt) ?? today;
-  // C9 = End Date: merged or closed date — left blank if PR is still open
-  const endDate = fmtDate(prData.closedAt);
-  if (endDate) { ws.getCell('C9').value = endDate; }
 
-  // ── Fill checklist rows 11-35 (cols E, F, G, H, I) ───────────────────────
+  ws.cell('C8').value(fmtDate(prData.createdAt) ?? today);
+  const endDate = fmtDate(prData.closedAt);
+  if (endDate) { ws.cell('C9').value(endDate); }
+
+  // ── Fill checklist rows 11-35 ─────────────────────────────────────────────
   const findingMap = new Map<number, RowFinding>();
   findings.forEach(f => findingMap.set(f.rowId, f));
-
-  const notOkFill: ExcelJS.Fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFCE4D6' } };
-  const okFill:    ExcelJS.Fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE2EFDA' } };
-  const naFill:    ExcelJS.Fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFF2CC' } };
 
   for (let rowId = 1; rowId <= 25; rowId++) {
     const rowNum = rowId + 10;
     const f = findingMap.get(rowId);
     if (!f) { continue; }
 
-    ws.getCell(`E${rowNum}`).value = f.authorStatus;
+    ws.cell(`E${rowNum}`).value(f.authorStatus);
 
-    const fCell = ws.getCell(`F${rowNum}`);
-    fCell.value = f.reviewerStatus;
-    fCell.fill = f.reviewerStatus === 'Not Ok' ? notOkFill
-               : f.reviewerStatus === 'Ok'     ? okFill
-               : naFill;
+    ws.cell(`F${rowNum}`).value(f.reviewerStatus);
+    // Colour the reviewer status cell
+    const fillColor = f.reviewerStatus === 'Not Ok' ? 'FCE4D6'
+                    : f.reviewerStatus === 'Ok'     ? 'E2EFDA'
+                    : 'FFFF2CC';
+    ws.cell(`F${rowNum}`).style('fill', fillColor);
 
-    ws.getCell(`G${rowNum}`).value = f.finding;
-    ws.getCell(`H${rowNum}`).value = f.defectType;
-    ws.getCell(`I${rowNum}`).value = f.remarks;
+    ws.cell(`G${rowNum}`).value(f.finding);
+    ws.cell(`H${rowNum}`).value(f.defectType);
+    ws.cell(`I${rowNum}`).value(f.remarks);
   }
 
-  // ── Write computed summary counts (bypasses stale formula cache) ──────────
+  // ── Pre-compute summary counts (no formula cache issues) ──────────────────
   const countE = (v: string) => findings.filter(f => f.authorStatus   === v).length;
   const countF = (v: string) => findings.filter(f => f.reviewerStatus === v).length;
   const countH = (v: string) => findings.filter(f => f.defectType     === v).length;
 
-  ws.getCell('J4').value = countE('Yes');
-  ws.getCell('J5').value = countE('No');
-  ws.getCell('J6').value = countE('NA');
-  ws.getCell('J8').value = countF('Ok');
-  ws.getCell('J9').value = countF('Not Ok');
-  ws.getCell('H3').value = countH('Functional');
-  ws.getCell('H4').value = countH('Technical');
-  ws.getCell('H5').value = countH('Process/Compliance');
-  ws.getCell('H6').value = countH('Documentation');
-  ws.getCell('H7').value = countH('Others');
-  ws.getCell('H9').value = findings.filter(f => f.defectType !== '').length;
+  ws.cell('J4').value(countE('Yes'));
+  ws.cell('J5').value(countE('No'));
+  ws.cell('J6').value(countE('NA'));
+  ws.cell('J8').value(countF('Ok'));
+  ws.cell('J9').value(countF('Not Ok'));
+  ws.cell('H3').value(countH('Functional'));
+  ws.cell('H4').value(countH('Technical'));
+  ws.cell('H5').value(countH('Process/Compliance'));
+  ws.cell('H6').value(countH('Documentation'));
+  ws.cell('H7').value(countH('Others'));
+  ws.cell('H9').value(findings.filter(f => f.defectType !== '').length);
 
-  // ── Re-review sheet (added when Not Ok rows exist) ────────────────────────
+  // ── Re-review Required sheet ──────────────────────────────────────────────
   const notOkFindings = findings.filter(f => f.reviewerStatus === 'Not Ok');
   if (notOkFindings.length > 0) {
-    const rrSheet = wb.addWorksheet('Re-review Required');
-    rrSheet.columns = [
-      { header: '#',                          key: 'id',       width: 5  },
-      { header: 'Review Area',                key: 'area',     width: 28 },
-      { header: 'Description of Finding',     key: 'finding',  width: 60 },
-      { header: 'Defect Type',                key: 'dtype',    width: 22 },
-      { header: 'Remarks / Action Required',  key: 'remarks',  width: 50 },
-      { header: 'Re-review Status',           key: 'status',   width: 18 },
-    ];
-
-    // Header row style
-    const hdrFill: ExcelJS.Fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFC00000' } };
-    rrSheet.getRow(1).eachCell(cell => {
-      cell.fill = hdrFill;
-      cell.font = { color: { argb: 'FFFFFFFF' }, bold: true, size: 11 };
-      cell.alignment = { vertical: 'middle', wrapText: true };
+    const rrSheet = wb.addSheet('Re-review Required');
+    const rrHeaders = ['#', 'Review Area', 'Description of Finding', 'Defect Type', 'Remarks / Action Required', 'Re-review Status'];
+    rrHeaders.forEach((h, i) => {
+      const col = String.fromCharCode(65 + i);
+      rrSheet.cell(`${col}1`).value(h)
+        .style({ bold: true, fontColor: 'FFFFFF', fill: 'C00000', horizontalAlignment: 'center' });
     });
-    rrSheet.getRow(1).height = 24;
 
-    // Data rows
     notOkFindings.forEach((f, idx) => {
-      const row = rrSheet.addRow({
-        id:      f.rowId,
-        area:    CHECKLIST_ROWS.find(r => r.id === f.rowId)?.reviewArea ?? '',
-        finding: f.finding,
-        dtype:   f.defectType,
-        remarks: f.remarks,
-        status:  '',     // to be filled after re-review
-      });
-      row.height = 40;
-      row.eachCell(cell => {
-        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: idx % 2 === 0 ? 'FFFFF2CC' : 'FFFCE4D6' } };
-        cell.font = { size: 10 };
-        cell.alignment = { vertical: 'top', wrapText: true };
-        cell.border = {
-          top:    { style: 'thin', color: { argb: 'FFBFBFBF' } },
-          bottom: { style: 'thin', color: { argb: 'FFBFBFBF' } },
-          left:   { style: 'thin', color: { argb: 'FFBFBFBF' } },
-          right:  { style: 'thin', color: { argb: 'FFBFBFBF' } },
-        };
+      const row  = idx + 2;
+      const fill = idx % 2 === 0 ? 'FFF2CC' : 'FCE4D6';
+      const area = CHECKLIST_ROWS.find(r => r.id === f.rowId)?.reviewArea ?? '';
+      [f.rowId, area, f.finding, f.defectType, f.remarks, ''].forEach((val, i) => {
+        rrSheet.cell(`${String.fromCharCode(65 + i)}${row}`)
+          .value(val)
+          .style({ fill, wrapText: true });
       });
     });
   }
 
-  // ── Version history sheet ─────────────────────────────────────────────────
-  const histSheet = wb.addWorksheet('Version History');
-  histSheet.columns = [
-    { header: 'Version',  key: 'ver',     width: 16 },
-    { header: 'Date',     key: 'date',    width: 14 },
-    { header: 'Not Ok',   key: 'notok',   width: 10 },
-    { header: 'Ok',       key: 'ok',      width: 10 },
-    { header: 'NA',       key: 'na',      width: 10 },
-    { header: 'Comments', key: 'comments',width: 60 },
-  ];
-  const hFill: ExcelJS.Fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1F3864' } };
-  histSheet.getRow(1).eachCell(cell => {
-    cell.fill = hFill;
-    cell.font = { color: { argb: 'FFFFFFFF' }, bold: true, size: 10 };
-    cell.alignment = { vertical: 'middle' };
+  // ── Version History sheet ─────────────────────────────────────────────────
+  const histSheet = wb.addSheet('Version History');
+  const histHeaders = ['Version', 'Date', 'Not Ok', 'Ok', 'NA', 'Comments'];
+  histHeaders.forEach((h, i) => {
+    histSheet.cell(`${String.fromCharCode(65 + i)}1`).value(h)
+      .style({ bold: true, fontColor: 'FFFFFF', fill: '1F3864' });
   });
-  histSheet.getRow(1).height = 20;
 
-  // Past versions (comments left blank for reviewer to fill)
-  previousVersions.forEach(v => {
-    const row = histSheet.addRow({
-      ver:      `v${v.version}`,
-      date:     v.date,
-      notok:    v.notOkCount,
-      ok:       v.okCount,
-      na:       0,          // not stored in index, left as 0 for older entries
-      comments: '',
+  previousVersions.forEach((v: IndexEntry, idx: number) => {
+    const row = idx + 2;
+    [v.version ? `v${v.version}` : '', v.date, v.notOkCount, v.okCount, 0, ''].forEach((val, i) => {
+      histSheet.cell(`${String.fromCharCode(65 + i)}${row}`).value(val);
     });
-    row.eachCell(cell => { cell.alignment = { vertical: 'middle', wrapText: true }; });
   });
 
-  // Current version row
-  const curRow = histSheet.addRow({
-    ver:      `v${version} (current)`,
-    date:     new Date().toISOString().slice(0, 10),
-    notok:    notOkFindings.length,
-    ok:       countF('Ok'),
-    na:       findings.filter(f => f.reviewerStatus === 'NA').length,
-    comments: '',
-  });
-  curRow.height = 20;
-  curRow.getCell(1).font = { bold: true, size: 10 };
-  // Light yellow highlight on current row so it stands out
-  curRow.eachCell(cell => {
-    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFF2CC' } };
-    cell.alignment = { vertical: 'middle', wrapText: true };
+  const curRow = previousVersions.length + 2;
+  [`v${version} (current)`, new Date().toISOString().slice(0, 10),
+   notOkFindings.length, countF('Ok'), findings.filter(f => f.reviewerStatus === 'NA').length, ''
+  ].forEach((val, i) => {
+    histSheet.cell(`${String.fromCharCode(65 + i)}${curRow}`)
+      .value(val)
+      .style({ fill: 'FFF2CC', bold: i === 0 });
   });
 
-  // ── Protect all sheets — read-only, no password needed to view ───────────
-  const readOnlyOptions = {
-    selectLockedCells:   true,
-    selectUnlockedCells: true,
-    formatCells:         false,
-    formatColumns:       false,
-    formatRows:          false,
-    insertColumns:       false,
-    insertRows:          false,
-    insertHyperlinks:    false,
-    deleteColumns:       false,
-    deleteRows:          false,
-    sort:                false,
-    autoFilter:          false,
-    pivotTables:         false,
-  };
-  await ws.protect('', readOnlyOptions);
-  if (notOkFindings.length > 0) {
-    const rrSheet = wb.getWorksheet('Re-review Required');
-    if (rrSheet) { await rrSheet.protect('', readOnlyOptions); }
-  }
-  await histSheet.protect('', readOnlyOptions);
+  // ── Set ROR as active tab ─────────────────────────────────────────────────
+  wb.activeSheet(ws);
 
-  // ── SharePoint / Microsoft Excel compatibility fixes ──────────────────────
-
-  // 1. Force full recalculation on open — without this, SharePoint shows formula
-  //    cells (COUNTIF totals, SUM rows) as blank until the user manually recalcs.
-  (wb as any).calcProperties = { fullCalcOnLoad: true };
-
-  // 2. Mark ROR as the active sheet correctly — find its actual index so we
-  //    don't hardcode 0 (which breaks if ExcelJS re-orders sheets internally).
-  const rorIndex = wb.worksheets.findIndex(s => s.name === 'ROR');
-  ws.state = 'visible';
-
-  // 3. Update activeTab on the EXISTING workbook view instead of replacing it.
-  //    Replacing wb.views entirely strips out SharePoint-specific view metadata
-  //    stored in the original template (e.g. windowWidth/Height, tabRatio).
-  if (wb.views.length > 0) {
-    (wb.views[0] as any).activeTab  = Math.max(0, rorIndex);
-    (wb.views[0] as any).firstSheet = 0;
-  } else {
-    wb.views = [{ x: 0, y: 0, width: 28800, height: 17460,
-                  firstSheet: 0, activeTab: Math.max(0, rorIndex),
-                  visibility: 'visible' }];
-  }
-
-  await wb.xlsx.writeFile(outputPath);
+  await wb.toFileAsync(outputPath);
 }
 
 
