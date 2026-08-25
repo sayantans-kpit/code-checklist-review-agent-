@@ -210,13 +210,14 @@ async function fetchFromGitHub(prUrl: string, token: string): Promise<PRData> {
     'User-Agent': 'code-review-checklist-agent',
   };
 
-  // Parallel fetch: PR info, reviews, inline comments, files, requested reviewers
-  const [prRes, reviewsRes, inlineRes, filesRes, reqReviewersRes] = await Promise.all([
+  // Parallel fetch: PR info, reviews, inline comments, files, requested reviewers, issue comments
+  const [prRes, reviewsRes, inlineRes, filesRes, reqReviewersRes, issueCommentsRes] = await Promise.all([
     httpsGet(`${base}/pulls/${number}`,                          headers),
     httpsGet(`${base}/pulls/${number}/reviews`,                  headers),
     httpsGet(`${base}/pulls/${number}/comments`,                 headers),
     httpsGet(`${base}/pulls/${number}/files?per_page=100`,       headers),
     httpsGet(`${base}/pulls/${number}/requested_reviewers`,      headers),
+    httpsGet(`${base}/issues/${number}/comments?per_page=100`,   headers),  // PR conversation thread
   ]);
 
   if (!prRes.ok) {
@@ -228,10 +229,11 @@ async function fetchFromGitHub(prUrl: string, token: string): Promise<PRData> {
   }
 
   const pr            = await prRes.json() as any;
-  const reviews       = reviewsRes.ok       ? (await reviewsRes.json() as any[])       : [];
-  const inlines       = inlineRes.ok        ? (await inlineRes.json() as any[])        : [];
-  const rawFiles      = filesRes.ok         ? (await filesRes.json() as any[])         : [];
-  const reqReviewers  = reqReviewersRes.ok  ? (await reqReviewersRes.json() as any)    : {};
+  const reviews       = reviewsRes.ok         ? (await reviewsRes.json() as any[])       : [];
+  const inlines       = inlineRes.ok          ? (await inlineRes.json() as any[])        : [];
+  const rawFiles      = filesRes.ok           ? (await filesRes.json() as any[])         : [];
+  const reqReviewers  = reqReviewersRes.ok    ? (await reqReviewersRes.json() as any)    : {};
+  const issueComments = issueCommentsRes.ok   ? (await issueCommentsRes.json() as any[]) : [];
 
   // Build reviewer list: people who submitted a review + people still requested
   const reviewerSet = new Set<string>();
@@ -241,12 +243,18 @@ async function fetchFromGitHub(prUrl: string, token: string): Promise<PRData> {
   const reviewers = Array.from(reviewerSet);
 
   const comments: string[] = [
+    // Review-level summary comments (Approved / Request changes + body)
     ...reviews
       .filter((r: any) => r.body?.trim())
       .map((r: any) => `[Review by ${r.user?.login}] ${r.body.trim()}`),
+    // Inline code comments on specific diff lines
     ...inlines
       .filter((c: any) => c.body?.trim())
       .map((c: any) => `[${c.user?.login} on ${c.path}:${c.line ?? c.original_line}] ${c.body.trim()}`),
+    // General PR conversation thread — Copilot bot, LGTM, general discussion
+    ...issueComments
+      .filter((c: any) => c.body?.trim())
+      .map((c: any) => `[${c.user?.login} (conversation)] ${c.body.trim()}`),
   ];
 
   const files: FilePatch[] = rawFiles.map((f: any) => ({
@@ -1669,6 +1677,7 @@ export function activate(context: vscode.ExtensionContext) {
         ].join('\n'));
         stream.markdown(
           `✅ GitHub: **${prData.comments.length}** comment(s), **${prData.files.length}** changed file(s)\n` +
+          `   _(includes review comments, inline code comments + PR conversation thread)_\n` +
           (prData.assignees.length ? `👤 Assignee(s): **${prData.assignees.join(', ')}**\n` : '') +
           (prData.reviewers.length ? `👥 Reviewer(s): **${prData.reviewers.join(', ')}**\n` : '') +
           `\n**Changed files:**\n\`\`\`\n${prData.diffSummary}\n\`\`\`\n`
