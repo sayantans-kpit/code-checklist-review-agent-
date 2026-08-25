@@ -1,8 +1,8 @@
 {
   "name": "code-review-checklist-agent",
   "displayName": "Code Review Checklist Agent",
-  "description": "PSSM2.0 Code Review Checklist Agent \u2014 conversational AI that generates, analyses and tracks code review checklists from GitHub PRs and Jira stories",
-  "version": "1.0.4",
+  "description": "PSSM2.0 Code Review Checklist Agent — conversational AI that generates, analyses and tracks code review checklists from GitHub PRs and Jira stories",
+  "version": "1.0.5",
   "engines": {
     "vscode": "^1.90.0"
   },

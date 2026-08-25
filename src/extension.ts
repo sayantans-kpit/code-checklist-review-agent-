@@ -169,7 +169,7 @@ function fmtDate(iso: string | null): string | null {
 
 /** HTTPS GET using Node built-in module — more reliable in VS Code extension host.
  *  Gives actionable errors for proxy/VPN/cert issues. */
-function httpsGet(url: string, headers: Record<string, string>): Promise<{ok: boolean; status: number; text: () => Promise<string>; json: () => Promise<any>}> {
+function httpsGet(url: string, headers: Record<string, string>): Promise<{ok: boolean; status: number; _linkHeader?: string; text: () => Promise<string>; json: () => Promise<any>}> {
   return new Promise((resolve, reject) => {
     const https  = require('https') as typeof import('https');
     const urlObj = new URL(url);
@@ -179,9 +179,10 @@ function httpsGet(url: string, headers: Record<string, string>): Promise<{ok: bo
         const chunks: Buffer[] = [];
         res.on('data', (c: Buffer) => chunks.push(c));
         res.on('end', () => {
-          const body = Buffer.concat(chunks).toString('utf8');
-          const status = res.statusCode ?? 0;
-          resolve({ok: status >= 200 && status < 300, status, text: () => Promise.resolve(body), json: () => Promise.resolve(JSON.parse(body))});
+          const body       = Buffer.concat(chunks).toString('utf8');
+          const status     = res.statusCode ?? 0;
+          const linkHeader = (res.headers['link'] as string | undefined);
+          resolve({ok: status >= 200 && status < 300, status, _linkHeader: linkHeader, text: () => Promise.resolve(body), json: () => Promise.resolve(JSON.parse(body))});
         });
       }
     );
@@ -197,6 +198,31 @@ function httpsGet(url: string, headers: Record<string, string>): Promise<{ok: bo
   });
 }
 
+/** Fetch all pages of a GitHub API list endpoint (handles pagination automatically).
+ *  GitHub returns max 100 items per page — this fetches until no next page. */
+async function fetchAllPages(baseUrl: string, headers: Record<string, string>): Promise<any[]> {
+  const all: any[] = [];
+  let url: string | null = baseUrl.includes('per_page')
+    ? baseUrl
+    : (baseUrl.includes('?') ? `${baseUrl}&per_page=100` : `${baseUrl}?per_page=100`);
+
+  while (url !== null) {
+    const currentUrl: string = url;
+    const res = await httpsGet(currentUrl, headers);
+    if (!res.ok) { break; }
+
+    const page = await res.json() as any[];
+    if (Array.isArray(page)) { all.push(...page); }
+
+    // GitHub Link header: <https://...?page=2>; rel="next", <https://...?page=5>; rel="last"
+    const linkHeader: string = res._linkHeader ?? '';
+    const nextMatch: RegExpMatchArray | null = linkHeader.match(/<([^>]+)>;\s*rel="next"/);
+    url = nextMatch ? nextMatch[1] : null;
+  }
+
+  return all;
+}
+
 async function fetchFromGitHub(prUrl: string, token: string): Promise<PRData> {
   const parsed = parsePRUrl(prUrl);
   if (!parsed) { throw new Error('Cannot parse GitHub PR URL: ' + prUrl); }
@@ -210,14 +236,11 @@ async function fetchFromGitHub(prUrl: string, token: string): Promise<PRData> {
     'User-Agent': 'code-review-checklist-agent',
   };
 
-  // Parallel fetch: PR info, reviews, inline comments, files, requested reviewers, issue comments
-  const [prRes, reviewsRes, inlineRes, filesRes, reqReviewersRes, issueCommentsRes] = await Promise.all([
+  // Fetch PR info and static data in parallel, paginated comments sequentially after
+  const [prRes, filesRes, reqReviewersRes] = await Promise.all([
     httpsGet(`${base}/pulls/${number}`,                          headers),
-    httpsGet(`${base}/pulls/${number}/reviews`,                  headers),
-    httpsGet(`${base}/pulls/${number}/comments`,                 headers),
     httpsGet(`${base}/pulls/${number}/files?per_page=100`,       headers),
     httpsGet(`${base}/pulls/${number}/requested_reviewers`,      headers),
-    httpsGet(`${base}/issues/${number}/comments?per_page=100`,   headers),  // PR conversation thread
   ]);
 
   if (!prRes.ok) {
@@ -228,12 +251,16 @@ async function fetchFromGitHub(prUrl: string, token: string): Promise<PRData> {
     throw new Error(`GitHub API ${prRes.status}${hint}: ${body.slice(0, 200)}`);
   }
 
-  const pr            = await prRes.json() as any;
-  const reviews       = reviewsRes.ok         ? (await reviewsRes.json() as any[])       : [];
-  const inlines       = inlineRes.ok          ? (await inlineRes.json() as any[])        : [];
-  const rawFiles      = filesRes.ok           ? (await filesRes.json() as any[])         : [];
-  const reqReviewers  = reqReviewersRes.ok    ? (await reqReviewersRes.json() as any)    : {};
-  const issueComments = issueCommentsRes.ok   ? (await issueCommentsRes.json() as any[]) : [];
+  // Paginated comment fetches — all pages, no 100-item cap
+  const [reviews, inlines, issueComments] = await Promise.all([
+    fetchAllPages(`${base}/pulls/${number}/reviews`,   headers),   // review summaries
+    fetchAllPages(`${base}/pulls/${number}/comments`,  headers),   // inline code comments
+    fetchAllPages(`${base}/issues/${number}/comments`, headers),   // full conversation thread
+  ]);
+
+  const pr           = await prRes.json() as any;
+  const rawFiles     = filesRes.ok        ? (await filesRes.json() as any[]) : [];
+  const reqReviewers = reqReviewersRes.ok ? (await reqReviewersRes.json() as any) : {};
 
   // Build reviewer list: people who submitted a review + people still requested
   const reviewerSet = new Set<string>();
