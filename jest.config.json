@@ -1,0 +1,21 @@
+{
+  "preset": "ts-jest",
+  "testEnvironment": "node",
+  "roots": ["<rootDir>/src/__tests__"],
+  "testMatch": ["**/*.test.ts"],
+  "moduleNameMapper": {
+    "^vscode$": "<rootDir>/src/__tests__/__mocks__/vscode.ts"
+  },
+  "collectCoverageFrom": [
+    "src/utils.ts"
+  ],
+  "coverageReporters": ["text", "lcov"],
+  "transform": {
+    "^.+\\.ts$": ["ts-jest", {
+      "tsconfig": {
+        "module": "commonjs",
+        "esModuleInterop": true
+      }
+    }]
+  }
+}
