@@ -732,8 +732,30 @@ class IndexStore {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Excel generator — fills the original template file directly
+// Excel generator — surgical ZIP patch approach
 // ─────────────────────────────────────────────────────────────────────────────
+//
+// WHY NOT SheetJS/ExcelJS/xlsx-populate for writeFile:
+//   All three libraries re-serialize the entire workbook when writing, which:
+//   1. Rebuilds styles.xml from scratch — the template has 64 cell styles; the
+//      output gets 2. Every cell with s="N" (N > 1) references a non-existent
+//      style → Excel renders the sheet blank and refuses to display content.
+//   2. Drops 525 empty-styled cells — cells that exist only to carry border/fill
+//      formatting; removing them erases all visual structure.
+//   3. Corrupts the SharedStrings table — 75 of 118 entries are reordered or
+//      replaced, so most cells display wrong text.
+//   4. Strips xl/tables/table1.xml — the table part is silently discarded;
+//      strict Excel validates the relationship and may refuse to open.
+//   5. Drops calcChain.xml — formulas recalculate, but the first open is slow.
+//   LibreOffice tolerates all of the above; Windows/Mac Excel and SharePoint do
+//   not.
+//
+// FIX: copy the template byte-for-byte, then use jszip to patch only the two
+//   XML files that change (sheet1.xml, sharedStrings.xml).  Everything else
+//   (styles, tables, calcChain, relationships, customXml) is left untouched.
+//   Additional sheets (Re-review Required, Version History) are injected as
+//   fresh minimal OOXML parts; the workbook manifest and content-type registry
+//   are updated accordingly.
 
 async function generateExcel(
   prData: PRData,
@@ -747,48 +769,128 @@ async function generateExcel(
 ): Promise<void> {
 
   // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const XLSX = require('xlsx');
+  const JSZip = require('jszip');
 
-  // Read template — cellStyles:true preserves all formatting, fills, borders, merges
-  const wb = XLSX.readFile(templatePath, { cellStyles: true, cellFormula: true, bookVBA: false });
-  const ws = wb.Sheets['ROR'];
-  if (!ws) { throw new Error('Sheet "ROR" not found in template'); }
+  // ── Load template as zip ──────────────────────────────────────────────────
+  const templateBuf = fs.readFileSync(templatePath);
+  const zip = await JSZip.loadAsync(templateBuf);
 
-  const today = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+  // ── Helpers ───────────────────────────────────────────────────────────────
 
-  /** Set a cell value, preserving its existing style from the template */
-  function setVal(addr: string, val: string | number | null): void {
-    if (val === null || val === undefined || val === '') { return; }
-    const existing = ws[addr];
-    if (existing) {
-      // Update value only — keep style, formula references, etc.
-      existing.v = val;
-      existing.t = typeof val === 'number' ? 'n' : 's';
-      delete existing.f;   // remove formula — we're writing a computed value
-      delete existing.w;   // remove cached formatted text so Excel recalculates
-    } else {
-      ws[addr] = { t: typeof val === 'number' ? 'n' : 's', v: val };
-    }
+  /** XML-escape a plain string for embedding in element text content. */
+  function xe(s: string): string {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
-  // ── Fill header cells ─────────────────────────────────────────────────────
+  /**
+   * Patch a single cell in sheet XML.
+   * - For string values: updates to t="s" and sets <v>sstIdx</v>, preserving
+   *   the original s= style attribute and dropping any formula.
+   * - For number values: updates to numeric type, sets <v>num</v>, preserving
+   *   s= and dropping formulas (pre-computed summary counts).
+   * - The original cell must exist in the template XML; this function never
+   *   inserts new cells because the template already contains every target cell
+   *   (even header/summary cells that are initially empty).
+   */
+  function patchCell(
+    xml: string,
+    addr: string,
+    value: string | number,
+    sstIdx?: number   // only for string values
+  ): string {
+    const isNum = typeof value === 'number';
+    const escaped = addr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    // Build the replacement cell preserving only the s= attribute.
+    function rebuild(attrs: string): string {
+      const styleAttr = (attrs.match(/\s+s="[^"]*"/) ?? [''])[0];
+      if (isNum) {
+        return `<c r="${addr}"${styleAttr}><v>${value}</v></c>`;
+      } else {
+        return `<c r="${addr}"${styleAttr} t="s"><v>${sstIdx}</v></c>`;
+      }
+    }
+
+    // Self-closing cell (no existing value):  <c r="E11" s="3"/>
+    const scRe = new RegExp(`<c r="${escaped}"([^>]*)\\/>`);
+    if (scRe.test(xml)) {
+      return xml.replace(scRe, (_, attrs) => rebuild(attrs));
+    }
+
+    // Cell with content (may have <f>, <v>, both, or neither):
+    // <c r="C4" s="39" t="s"><v>11</v></c>
+    const wcRe = new RegExp(`<c r="${escaped}"([^>]*)>[\\s\\S]*?<\\/c>`);
+    if (wcRe.test(xml)) {
+      return xml.replace(wcRe, (_, attrs) => rebuild(attrs));
+    }
+
+    // Cell is absent from the template — insert at end of its row.
+    const rowNum = addr.match(/\d+/)![0];
+    const rowRe  = new RegExp(`(<row[^>]* r="${rowNum}"[^>]*>)([\\s\\S]*?)(<\\/row>)`);
+    return xml.replace(rowRe, (_, open, body, close) => {
+      const newCell = isNum
+        ? `<c r="${addr}"><v>${value}</v></c>`
+        : `<c r="${addr}" t="s"><v>${sstIdx}</v></c>`;
+      return `${open}${body}${newCell}${close}`;
+    });
+  }
+
+  // ── Parse existing SharedStrings ──────────────────────────────────────────
+  const sstRaw  = await zip.file('xl/sharedStrings.xml')!.async('string');
+  // Extract every <si> entry verbatim so we never corrupt existing entries.
+  const siEntries: string[] = [];
+  const siRe = /<si>([\s\S]*?)<\/si>/g;
+  let m: RegExpExecArray | null;
+  while ((m = siRe.exec(sstRaw)) !== null) { siEntries.push(m[1]); }
+
+  // Build a plain-text → index lookup for the entries we can easily compare.
+  // For entries that contain only a simple <t>…</t>, extract the text; others
+  // (rich-text <r> elements) are left as-is and never re-used for new values.
+  const sstTextToIdx = new Map<string, number>();
+  siEntries.forEach((body, i) => {
+    const tm = body.match(/^<t[^>]*>([\s\S]*?)<\/t>$/);
+    if (tm) { sstTextToIdx.set(tm[1], i); }
+  });
+
+  /**
+   * Return the SST index for `value`, appending a new entry if necessary.
+   * We never replace existing entries — only ever append.
+   */
+  function sstIndex(value: string): number {
+    if (sstTextToIdx.has(value)) { return sstTextToIdx.get(value)!; }
+    const idx = siEntries.length;
+    const needsPreserve = /^\s|\s$/.test(value);
+    siEntries.push(`<t${needsPreserve ? ' xml:space="preserve"' : ''}>${xe(value)}</t>`);
+    sstTextToIdx.set(value, idx);
+    return idx;
+  }
+
+  // ── Read sheet XML ────────────────────────────────────────────────────────
+  let sheetXml = await zip.file('xl/worksheets/sheet1.xml')!.async('string');
+
+  // ── Build cell assignments ────────────────────────────────────────────────
+  const today = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+
   const keyBrackets = (jiraStories.length > 0
-    ? jiraStories.map((s: any) => s.key)
+    ? jiraStories.map((s: JiraStory) => s.key)
     : detectedJiraKeys
   ).map((k: string) => `[${k}]`).join(' ');
 
-  setVal('C4', keyBrackets ? `${prData.url} ${keyBrackets}` : prData.url);
-  setVal('C5', `v${version}`);
+  const strAssigns: Array<[string, string]> = [];
+  const numAssigns: Array<[string, number]> = [];
+
+  const c4Val = keyBrackets ? `${prData.url} ${keyBrackets}` : prData.url;
+  strAssigns.push(['C4', c4Val]);
+  strAssigns.push(['C5', `v${version}`]);
 
   const authorVal = prData.assignees.length ? prData.assignees.join(', ') : prData.author;
-  if (authorVal) { setVal('C6', authorVal); }
-  if (prData.reviewers.length) { setVal('C7', `SME - ${prData.reviewers.join(', ')}`); }
+  if (authorVal) { strAssigns.push(['C6', authorVal]); }
+  if (prData.reviewers.length) { strAssigns.push(['C7', `SME - ${prData.reviewers.join(', ')}`]); }
 
-  setVal('C8', fmtDate(prData.createdAt) ?? today);
+  strAssigns.push(['C8', fmtDate(prData.createdAt) ?? today]);
   const endDate = fmtDate(prData.closedAt);
-  if (endDate) { setVal('C9', endDate); }
+  if (endDate) { strAssigns.push(['C9', endDate]); }
 
-  // ── Fill checklist rows 11-35 (cols E, F, G, H, I) ───────────────────────
   const findingMap = new Map<number, RowFinding>();
   findings.forEach(f => findingMap.set(f.rowId, f));
 
@@ -796,29 +898,92 @@ async function generateExcel(
     const rowNum = rowId + 10;
     const f = findingMap.get(rowId);
     if (!f) { continue; }
-    setVal(`E${rowNum}`, f.authorStatus);
-    setVal(`F${rowNum}`, f.reviewerStatus);
-    setVal(`G${rowNum}`, f.finding);
-    setVal(`H${rowNum}`, f.defectType);
-    setVal(`I${rowNum}`, f.remarks);
+    if (f.authorStatus)   { strAssigns.push([`E${rowNum}`, f.authorStatus]); }
+    if (f.reviewerStatus) { strAssigns.push([`F${rowNum}`, f.reviewerStatus]); }
+    if (f.finding)        { strAssigns.push([`G${rowNum}`, f.finding]); }
+    if (f.defectType)     { strAssigns.push([`H${rowNum}`, f.defectType]); }
+    if (f.remarks)        { strAssigns.push([`I${rowNum}`, f.remarks]); }
   }
 
-  // ── Pre-compute summary counts (bypasses stale formula cache) ─────────────
   const countE = (v: string) => findings.filter(f => f.authorStatus   === v).length;
   const countF = (v: string) => findings.filter(f => f.reviewerStatus === v).length;
   const countH = (v: string) => findings.filter(f => f.defectType     === v).length;
 
-  setVal('J4', countE('Yes'));     setVal('J5', countE('No'));    setVal('J6', countE('NA'));
-  setVal('J8', countF('Ok'));      setVal('J9', countF('Not Ok'));
-  setVal('H3', countH('Functional'));   setVal('H4', countH('Technical'));
-  setVal('H5', countH('Process/Compliance'));
-  setVal('H6', countH('Documentation')); setVal('H7', countH('Others'));
-  setVal('H9', findings.filter(f => f.defectType !== '').length);
+  numAssigns.push(['J4', countE('Yes')],   ['J5', countE('No')],    ['J6', countE('NA')]);
+  numAssigns.push(['J8', countF('Ok')],    ['J9', countF('Not Ok')]);
+  numAssigns.push(['H3', countH('Functional')],
+                  ['H4', countH('Technical')],
+                  ['H5', countH('Process/Compliance')],
+                  ['H6', countH('Documentation')],
+                  ['H7', countH('Others')],
+                  ['H9', findings.filter(f => f.defectType !== '').length]);
 
-  // ── Re-review Required sheet ──────────────────────────────────────────────
+  // ── Apply patches ─────────────────────────────────────────────────────────
+  for (const [addr, val] of strAssigns) {
+    sheetXml = patchCell(sheetXml, addr, val, sstIndex(val));
+  }
+  for (const [addr, val] of numAssigns) {
+    sheetXml = patchCell(sheetXml, addr, val);
+  }
+
+  // ── Rebuild sharedStrings.xml (append-only — existing indices unchanged) ──
+  const newSstXml =
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n` +
+    `<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" ` +
+    `count="${siEntries.length}" uniqueCount="${siEntries.length}">` +
+    siEntries.map(b => `<si>${b}</si>`).join('') +
+    `</sst>`;
+
+  // ── Write patched parts back into zip ─────────────────────────────────────
+  zip.file('xl/worksheets/sheet1.xml', sheetXml);
+  zip.file('xl/sharedStrings.xml', newSstXml);
+
+  // ── Helper: column index (0-based) → letter(s) ───────────────────────────
+  function colLetter(idx: number): string {
+    let s = '';
+    let n = idx;
+    do {
+      s = String.fromCharCode(65 + (n % 26)) + s;
+      n = Math.floor(n / 26) - 1;
+    } while (n >= 0);
+    return s;
+  }
+
+  // ── Helper: build minimal worksheet XML from a 2-D array ─────────────────
+  // Uses inlineStr (t="inlineStr") to avoid touching the SST in extra sheets.
+  function buildSheetXml(data: (string | number | null)[][], colWidths: number[]): string {
+    const colsDef = colWidths.length
+      ? `<cols>${colWidths.map((w, i) =>
+          `<col min="${i + 1}" max="${i + 1}" width="${w}" customWidth="1"/>`
+        ).join('')}</cols>`
+      : '';
+    const rowsXml = data.map((row, ri) => {
+      const cells = row.map((val, ci) => {
+        const addr = `${colLetter(ci)}${ri + 1}`;
+        if (val === null || val === undefined || val === '') {
+          return `<c r="${addr}"/>`;
+        }
+        if (typeof val === 'number') {
+          return `<c r="${addr}"><v>${val}</v></c>`;
+        }
+        return `<c r="${addr}" t="inlineStr"><is><t>${xe(String(val))}</t></is></c>`;
+      }).join('');
+      return `<row r="${ri + 1}">${cells}</row>`;
+    }).join('');
+    return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+      `<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" ` +
+      `xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">` +
+      `${colsDef}<sheetData>${rowsXml}</sheetData></worksheet>`;
+  }
+
+  // ── Build extra-sheet data ────────────────────────────────────────────────
   const notOkFindings = findings.filter(f => f.reviewerStatus === 'Not Ok');
+
+  interface ExtraSheet { name: string; xml: string; }
+  const extraSheets: ExtraSheet[] = [];
+
   if (notOkFindings.length > 0) {
-    const rrData: any[][] = [
+    const rrData: (string | number | null)[][] = [
       ['#', 'Review Area', 'Description of Finding', 'Defect Type', 'Suggested Action', 'Re-review Status'],
       ...notOkFindings.map(f => [
         f.rowId,
@@ -827,19 +992,16 @@ async function generateExcel(
         f.defectType,
         f.remarks,
         '',
-      ]),
+      ] as (string | number | null)[]),
     ];
-    const rrSheet = XLSX.utils.aoa_to_sheet(rrData);
-    rrSheet['!cols'] = [5, 28, 60, 22, 50, 18].map(w => ({ wch: w }));
-    XLSX.utils.book_append_sheet(wb, rrSheet, 'Re-review Required');
+    extraSheets.push({ name: 'Re-review Required', xml: buildSheetXml(rrData, [5, 28, 60, 22, 50, 18]) });
   }
 
-  // ── Version History sheet ─────────────────────────────────────────────────
-  const histData: any[][] = [
+  const histData: (string | number | null)[][] = [
     ['Version', 'Date', 'Not Ok', 'Ok', 'NA', 'Comments'],
-    ...previousVersions.map((v: IndexEntry) => [
-      `v${v.version}`, v.date, v.notOkCount, v.okCount, 0, '',
-    ]),
+    ...previousVersions.map((v: IndexEntry) =>
+      [`v${v.version}`, v.date, v.notOkCount, v.okCount, 0, ''] as (string | number | null)[]
+    ),
     [
       `v${version} (current)`,
       new Date().toISOString().slice(0, 10),
@@ -849,22 +1011,78 @@ async function generateExcel(
       '',
     ],
   ];
-  const histSheet = XLSX.utils.aoa_to_sheet(histData);
-  histSheet['!cols'] = [16, 14, 10, 10, 10, 60].map(w => ({ wch: w }));
-  XLSX.utils.book_append_sheet(wb, histSheet, 'Version History');
+  extraSheets.push({ name: 'Version History', xml: buildSheetXml(histData, [16, 14, 10, 10, 10, 60]) });
 
-  // ── Set ROR as the active tab ─────────────────────────────────────────────
-  if (!wb.Workbook) { wb.Workbook = {}; }
-  if (!wb.Workbook.Views) { wb.Workbook.Views = [{}]; }
-  wb.Workbook.Views[0].RTL    = false;
-  wb.Workbook.Views[0].ActiveTab = 0;  // ROR is always index 0
+  // ── Inject extra sheets into the zip and update manifests ─────────────────
+  if (extraSheets.length > 0) {
+    // Determine the next available rId and sheetId from workbook.xml.rels
+    let wbRelsXml  = await zip.file('xl/_rels/workbook.xml.rels')!.async('string');
+    let wbXml      = await zip.file('xl/workbook.xml')!.async('string');
+    let ctXml      = await zip.file('[Content_Types].xml')!.async('string');
 
-  // ── Write with maximum Windows/Mac/SharePoint compatibility ───────────────
-  XLSX.writeFile(wb, outputPath, {
-    bookSST:     true,   // shared string table — required by Windows Excel
-    compression: true,   // deflate compression
-    bookType:    'xlsx',
+    // Find highest existing rId number in workbook rels
+    const rIdNums  = [...wbRelsXml.matchAll(/Id="rId(\d+)"/g)].map(r => parseInt(r[1]));
+    let nextRId    = (rIdNums.length ? Math.max(...rIdNums) : 0) + 1;
+
+    // Count existing worksheets to name new sheet files
+    const wsCount  = [...wbXml.matchAll(/<sheet /g)].length;
+    let nextWsIdx  = wsCount + 1;  // 1-based; ROR is sheet1
+
+    // Find the highest sheetId in workbook.xml
+    const sheetIds = [...wbXml.matchAll(/sheetId="(\d+)"/g)].map(r => parseInt(r[1]));
+    let nextSheetId = (sheetIds.length ? Math.max(...sheetIds) : 0) + 1;
+
+    for (const es of extraSheets) {
+      const fileName = `sheet${nextWsIdx}.xml`;
+      const partPath = `xl/worksheets/${fileName}`;
+      const rId      = `rId${nextRId}`;
+      const sheetId  = nextSheetId;
+
+      // Add worksheet file
+      zip.file(partPath, es.xml);
+
+      // Add empty rels file for this worksheet (no printer settings etc.)
+      zip.file(
+        `xl/worksheets/_rels/${fileName}.rels`,
+        `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+        `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>`,
+      );
+
+      // Append relationship to workbook.xml.rels (before </Relationships>)
+      const wsRel =
+        `<Relationship Id="${rId}" ` +
+        `Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" ` +
+        `Target="worksheets/${fileName}"/>`;
+      wbRelsXml = wbRelsXml.replace('</Relationships>', `${wsRel}</Relationships>`);
+
+      // Append <sheet> to workbook.xml (before </sheets>)
+      const sheetEl =
+        `<sheet name="${xe(es.name)}" sheetId="${sheetId}" r:id="${rId}"/>`;
+      wbXml = wbXml.replace('</sheets>', `${sheetEl}</sheets>`);
+
+      // Append Override to [Content_Types].xml (before </Types>)
+      const ct =
+        `<Override PartName="/${partPath}" ` +
+        `ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`;
+      ctXml = ctXml.replace('</Types>', `${ct}</Types>`);
+
+      nextRId++;
+      nextWsIdx++;
+      nextSheetId++;
+    }
+
+    zip.file('xl/_rels/workbook.xml.rels', wbRelsXml);
+    zip.file('xl/workbook.xml', wbXml);
+    zip.file('[Content_Types].xml', ctXml);
+  }
+
+  // ── Write output ──────────────────────────────────────────────────────────
+  const outBuf = await zip.generateAsync({
+    type:             'nodebuffer',
+    compression:      'DEFLATE',
+    compressionOptions: { level: 6 },
   });
+  fs.writeFileSync(outputPath, outBuf);
 }
 
 
