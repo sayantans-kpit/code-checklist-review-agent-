@@ -1470,7 +1470,7 @@ export function activate(context: vscode.ExtensionContext) {
     let   prUrl    = urlMatch ? urlMatch[0] : null;  // let — reassigned in --list loop
 
     // --list: space/newline separated Jira keys and/or PR URLs
-    const listMatch = prompt.match(/--list\s+([\s\S]+?)(?=\n--[a-z]|\nPrompt:|$)/i);
+    const listMatch = prompt.match(/--list\s+([\s\S]+?)(?=\n--|$)/i);
     const listItems: string[] = listMatch
       ? listMatch[1].trim().split(/[\s,]+/).filter(Boolean)
       : [];
@@ -1485,22 +1485,28 @@ export function activate(context: vscode.ExtensionContext) {
     const sprintMatch   = prompt.match(/--sprint\s+(\S+)/i);
     const manualSprint  = sprintMatch ? `Sprint-${sprintMatch[1].replace(/^Sprint-?/i, '')}` : null;
 
-    // Extract Prompt: <spec> — everything after "Prompt:" up to next blank line or end
-    const specMatch  = prompt.match(/Prompt\s*:\s*([\s\S]*?)(?=\n\n|\n--|\n[A-Z]|$)/i);
-    const userSpec   = specMatch ? specMatch[1].trim() : '';
-
-    // Everything that isn't a flag or Prompt: spec is treated as pasted comments
-    const cleanPrompt = prompt
-      .replace(/--token\s+\S+/, '')
-      .replace(/--branch\s+\S+/, '')
-      .replace(/--base\s+\S+/, '')
-      .replace(/--jira\s+\S+/, '')
-      .replace(/--sprint\s+\S+/, '')
-      .replace(/--list\s+[\s\S]+?(?=\n--[a-z]|\nPrompt:|$)/i, '')
+    // Strip all flags and URLs — whatever free-form text remains is the user spec.
+    // No "Prompt:" keyword needed — just type extra context on a new line after the command.
+    const userSpec = prompt
+      .replace(/--token\s+\S+/g,  '')
+      .replace(/--branch\s+\S+/g, '')
+      .replace(/--base\s+\S+/g,   '')
+      .replace(/--jira\s+(?:[A-Z][A-Z0-9]+-\d+\s*)+/gi, '')
+      .replace(/--sprint\s+\S+/g, '')
+      .replace(/--list\s+[\s\S]+?(?=\n--|$)/gi, '')
       .replace(/https?:\/\/github\.com\/\S+/g, '')
-      .replace(/Prompt\s*:[\s\S]*$/i, '')
+      .replace(/Prompt\s*:/gi, '')   // strip "Prompt:" prefix if someone still uses it
+      .split('\n')
+      .map(l => l.trim())
+      .filter(Boolean)
+      .join('\n')
       .trim();
-    const pastedComments = cleanPrompt ? cleanPrompt.split('\n').map(l => l.trim()).filter(Boolean) : [];
+
+    // Pasted comments = lines that look like review comments (not flags, not URLs)
+    // Re-use the same cleaned text for backward compatibility
+    const pastedComments = userSpec
+      ? userSpec.split('\n').filter(l => !l.startsWith('--') && !l.match(/^https?:\/\//))
+      : [];
 
     // If --jira keys given without a PR URL → treat them as --list items
     // so the agent resolves the linked PR automatically from Jira dev-info.
@@ -2014,14 +2020,14 @@ N+1 query in users/index line 34
 
 ---
 
-### 💡 Prompt: — guide the AI with your specification
-Add context on any new line after the command:
+### 💡 Extra context — just type it after the command
+Add any extra instructions on a new line — no keyword needed:
 \`\`\`
 @code-review /generate https://github.com/org/repo/pull/42
-Prompt: Backend-only Rails PR — no React changes.
-        Performance is top priority, 10k+ cases in prod.
-        i18n skipped this sprint — mark those rows NA.
-        Team agreed to defer test coverage to next PR.
+Backend-only Rails PR — no React changes.
+Performance is top priority, 10k+ cases in prod.
+i18n skipped this sprint — mark those rows NA.
+Team agreed to defer test coverage to next PR.
 \`\`\`
 
 ---
