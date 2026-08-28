@@ -585,6 +585,58 @@ interface IndexFile {
 
 
 // ─────────────────────────────────────────────────────────────────────────────
+// SessionCache — persists PR data between commands in the same session.
+// Allows: @code-review <PR_URL>  →  @code-review /generate  (no re-fetch)
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface SessionCacheData {
+  prUrl:       string;
+  prData:      PRData;
+  jiraStories: JiraStory[];
+  detectedJiraKeys: string[];
+  savedAt:     string;
+}
+
+class SessionCache {
+  private cachePath: string;
+
+  constructor(codeReviewDir: string) {
+    this.cachePath = path.join(codeReviewDir, '.session.json');
+    fs.mkdirSync(codeReviewDir, { recursive: true });
+  }
+
+  save(data: SessionCacheData): void {
+    try {
+      fs.writeFileSync(this.cachePath, JSON.stringify(data, null, 2), 'utf8');
+    } catch { /* non-fatal */ }
+  }
+
+  load(): SessionCacheData | null {
+    try {
+      if (!fs.existsSync(this.cachePath)) { return null; }
+      const raw  = fs.readFileSync(this.cachePath, 'utf8');
+      const data = JSON.parse(raw) as SessionCacheData;
+      // Expire after 2 hours — PR conversations can be long but not days
+      const age  = Date.now() - new Date(data.savedAt).getTime();
+      if (age > 2 * 60 * 60 * 1000) { this.clear(); return null; }
+      return data;
+    } catch { return null; }
+  }
+
+  loadForUrl(prUrl: string): SessionCacheData | null {
+    const cached = this.load();
+    if (!cached) { return null; }
+    // Normalise URL comparison (strip trailing slash)
+    const normalize = (u: string) => u.replace(/\/+$/, '').toLowerCase();
+    return normalize(cached.prUrl) === normalize(prUrl) ? cached : null;
+  }
+
+  clear(): void {
+    try { if (fs.existsSync(this.cachePath)) { fs.unlinkSync(this.cachePath); } } catch { /* ok */ }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ContextWriter — writes a live .context.md that Copilot Chat reads via stream.reference()
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1213,8 +1265,10 @@ If they give you a file, extract actionable items and explain what you found.`;
 
 export function activate(context: vscode.ExtensionContext) {
 
-  const tokenStore = new TokenStore(context.secrets);
-  const jiraStore  = new JiraStore(context.secrets);
+  const tokenStore   = new TokenStore(context.secrets);
+  const jiraStore    = new JiraStore(context.secrets);
+  const workspaceRootForSession = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.env.HOME ?? '/tmp';
+  const sessionCache = new SessionCache(path.join(workspaceRootForSession, 'code-review'));
 
   const participant = vscode.chat.createChatParticipant('decisiv-pssm.code-review', async (
     request: vscode.ChatRequest,
@@ -1424,11 +1478,79 @@ export function activate(context: vscode.ExtensionContext) {
     if (request.command !== 'generate') {
       const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.env.HOME ?? '/tmp';
 
+      // Detect a bare PR URL in the prompt — load PR + write context without generating
+      const bareUrlMatch = request.prompt.match(/https?:\/\/github\.com\/[^\s]+\/pull\/\d+/);
+
       // If files had actionable items and no explicit command → treat as /generate --list
       if (fileItems.length > 0) {
         stream.markdown(`🔄 Found **${fileItems.length}** item(s) in file(s). Running checklist generation…\n`);
         // Fall through to generate with modified prompt by not returning here
-        // We'll handle this by pretending the user ran /generate --list <items>
+
+      } else if (bareUrlMatch && !request.prompt.includes('--')) {
+        // ── PR URL mode: load PR data, cache it, show summary, ready for /generate ──
+        const bareUrl      = bareUrlMatch[0];
+        const storedGHToken = await tokenStore.get();
+
+        if (!storedGHToken) {
+          stream.markdown([
+            `🔍 PR detected: \`${bareUrl}\`\n`,
+            `⚠️ No GitHub PAT saved — run \`@code-review /token <PAT>\` first, then try again.\n`,
+          ].join(''));
+          return;
+        }
+
+        stream.markdown(`🔍 Loading PR: \`${bareUrl}\`…\n`);
+
+        let prData: PRData;
+        try {
+          prData = await fetchFromGitHub(bareUrl, storedGHToken);
+          stream.markdown(
+            `✅ **${prData.title}**\n` +
+            `   ${prData.files.length} file(s) changed · ${prData.comments.length} comment(s)\n` +
+            (prData.assignees.length ? `👤 ${prData.assignees.join(', ')}\n` : '') +
+            (prData.reviewers.length ? `👥 ${prData.reviewers.join(', ')}\n` : '')
+          );
+        } catch (err: any) {
+          stream.markdown(`❌ Could not fetch PR: ${err.message}\n`);
+          return;
+        }
+
+        // Fetch Jira stories
+        const jiraCreds = await jiraStore.get();
+        const detectedJiraKeys = detectJiraKeys(prData);
+        let jiraStories: JiraStory[] = [];
+        if (jiraCreds && detectedJiraKeys.length > 0) {
+          stream.markdown(`🎫 Fetching Jira stor${detectedJiraKeys.length > 1 ? 'ies' : 'y'}: **${detectedJiraKeys.join(', ')}**…\n`);
+          jiraStories = await fetchJiraStories(detectedJiraKeys, jiraCreds, stream);
+        }
+
+        // Save to session cache so /generate can reuse without re-fetching
+        sessionCache.save({ prUrl: bareUrl, prData, jiraStories, detectedJiraKeys, savedAt: new Date().toISOString() });
+
+        // Write .context.md and reference it
+        const ctxWriter = new ContextWriter(path.join(workspaceRoot, 'code-review'));
+        ctxWriter.add('PR Loaded', [
+          `- URL: ${prData.url}`,
+          `- Title: ${prData.title}`,
+          `- Author: ${prData.author}`,
+          `- Assignees: ${prData.assignees.join(', ') || 'none'}`,
+          `- Reviewers: ${prData.reviewers.join(', ') || 'none'}`,
+          `- Branch: ${prData.branch} → ${prData.baseBranch}`,
+          `- Files changed: ${prData.files.length}`,
+          `- Comments: ${prData.comments.length}`,
+          jiraStories.length ? `- Jira stories: ${jiraStories.map(s => `[${s.key}] ${s.summary}`).join('; ')}` : '',
+        ].filter(Boolean).join('\n'));
+
+        stream.markdown([
+          `\n✅ **PR context loaded.** You can now:\n`,
+          `- Ask questions: _"What are the main changes in this PR?"_`,
+          `- Generate checklist: \`@code-review /generate\` ← no URL needed, uses this PR`,
+          `- Ask about Jira: _"Are the acceptance criteria for SRM2-2072 met?"_`,
+        ].join('\n'));
+
+        stream.reference(ctxWriter.uri);
+        return;
+
       } else {
         // Pure conversational question — answer using checklist knowledge + context
         let model: vscode.LanguageModelChat | undefined;
@@ -1516,9 +1638,20 @@ export function activate(context: vscode.ExtensionContext) {
         ? jiraOverrides
         : listItems;
 
+    // ── Check session cache — if no URL given, reuse last loaded PR ──────────
     if (!prUrl && !manualBranch && effectiveListItems.length === 0) {
-      stream.markdown('⚠️ Please provide a PR URL, `--branch <name>`, `--jira <key>`, or `--list <items>`.\n\n' + HELP_TEXT);
-      return;
+      const cached = sessionCache.load();
+      if (cached) {
+        stream.markdown(
+          `📋 Using cached PR from this session: \`${cached.prUrl}\`\n` +
+          `_(loaded ${new Date(cached.savedAt).toLocaleTimeString()})_\n\n` +
+          `> To use a different PR, pass the URL: \`@code-review /generate <PR_URL>\`\n`
+        );
+        prUrl = cached.prUrl;
+      } else {
+        stream.markdown('⚠️ Please provide a PR URL, `--branch <name>`, `--jira <key>`, or `--list <items>`.\n\n' + HELP_TEXT);
+        return;
+      }
     }
 
     if (userSpec) {
@@ -1588,43 +1721,43 @@ export function activate(context: vscode.ExtensionContext) {
 
     // ── Gather PR data ─────────────────────────────────────────────────────
     let prData: PRData;
+    let cachedJiraStories: JiraStory[] | null = null;    // set when reusing session cache
+    let cachedDetectedKeys: string[]   | null = null;
 
     if (prUrl && githubToken) {
-      // ── Path A: Full GitHub API (comments + code diff) ──────────────────
-      stream.markdown(`📡 Fetching PR data + code diff from GitHub API ${storedToken && !inlineToken ? '*(using saved PAT)*' : ''}…\n`);
-      try {
-        prData = await fetchFromGitHub(prUrl, githubToken);
-        ctxWriter.add('PR Data', [
-          `- Title: ${prData.title}`,
-          `- Author: ${prData.author}`,
-          `- Assignees: ${prData.assignees.join(', ') || 'none'}`,
-          `- Reviewers: ${prData.reviewers.join(', ') || 'none'}`,
-          `- Branch: ${prData.branch} → ${prData.baseBranch}`,
-          `- Files changed: ${prData.files.length}`,
-          `- Comments: ${prData.comments.length}`,
-          `- Created: ${prData.createdAt ?? 'unknown'}`,
-          `- Closed: ${prData.closedAt ?? 'open'}`,
-          '',
-          '**Changed files:**',
-          prData.diffSummary || '(none)',
-        ].join('\n'));
-        stream.markdown(
-          `✅ GitHub: **${prData.comments.length}** comment(s), **${prData.files.length}** changed file(s)\n` +
-          `   _(includes review comments, inline code comments + PR conversation thread)_\n` +
-          (prData.assignees.length ? `👤 Assignee(s): **${prData.assignees.join(', ')}**\n` : '') +
-          (prData.reviewers.length ? `👥 Reviewer(s): **${prData.reviewers.join(', ')}**\n` : '') +
-          `\n**Changed files:**\n\`\`\`\n${prData.diffSummary}\n\`\`\`\n`
-        );
-      } catch (err: any) {
-        ctxWriter.addError('GitHub API Failed', err, {
-          'PR URL': prUrl ?? '',
-          'PAT set': githubToken ? 'yes' : 'no',
-          'Hint': 'Run @code-review /token to update PAT, or check VPN/network',
-        });
-        stream.markdown(`❌ GitHub API failed: ${err.message}\n`);
-        stream.reference(ctxWriter.uri);
-        return;
+      // ── Path A: Check session cache first, then GitHub API ────────────────
+      const cached = sessionCache.loadForUrl(prUrl);
+      if (cached) {
+        stream.markdown(`⚡ Using session cache for \`${prUrl}\` _(no re-fetch needed)_\n`);
+        prData = cached.prData;
+        // Pre-inject Jira stories from cache so they don't need re-fetching
+        cachedJiraStories    = cached.jiraStories;
+        cachedDetectedKeys   = cached.detectedJiraKeys;
+      } else {
+        stream.markdown(`📡 Fetching PR data + code diff from GitHub API ${storedToken && !inlineToken ? '*(using saved PAT)*' : ''}…\n`);
+        try {
+          prData = await fetchFromGitHub(prUrl, githubToken);
+        } catch (err: any) {
+          ctxWriter.addError('GitHub API Failed', err, { 'PR URL': prUrl ?? '', 'PAT set': githubToken ? 'yes' : 'no', 'Hint': 'Run @code-review /token to update PAT, or check VPN/network' });
+          stream.markdown(`❌ GitHub API failed: ${err.message}\n`);
+          stream.reference(ctxWriter.uri);
+          return;
+        }
       }
+      ctxWriter.add('PR Data', [
+        `- Title: ${prData.title}`,
+        `- Branch: ${prData.branch} → ${prData.baseBranch}`,
+        `- Files changed: ${prData.files.length}`,
+        `- Comments: ${prData.comments.length}`,
+        prData.diffSummary || '(none)',
+      ].join('\n'));
+      stream.markdown(
+        `✅ GitHub: **${prData.comments.length}** comment(s), **${prData.files.length}** changed file(s)\n` +
+        `   _(includes review comments, inline code comments + PR conversation thread)_\n` +
+        (prData.assignees.length ? `👤 Assignee(s): **${prData.assignees.join(', ')}**\n` : '') +
+        (prData.reviewers.length ? `👥 Reviewer(s): **${prData.reviewers.join(', ')}**\n` : '') +
+        `\n**Changed files:**\n\`\`\`\n${prData.diffSummary}\n\`\`\`\n`
+      );
       if (pastedComments.length) { prData.comments.push(...pastedComments); }
 
     } else if (manualBranch) {
@@ -1697,32 +1830,48 @@ export function activate(context: vscode.ExtensionContext) {
     // ── Jira key detection + stories fetch ────────────────────────────────
     let jiraStories: JiraStory[] = [];
 
-    // Always detect keys — branch name, PR title, and PR description body.
-    // Keys are shown in C4 even when no Jira credentials are configured.
-    const detectedKeys: string[] = jiraOverrides.length > 0
-      ? jiraOverrides
-      : detectJiraKeys(prData);
+    // If session cache provided Jira data, use it directly — no re-fetch
+    if (cachedJiraStories !== null) {
+      jiraStories = cachedJiraStories;
+      const keys = cachedDetectedKeys ?? [];
+      if (jiraStories.length > 0) {
+        stream.markdown(`⚡ Using cached Jira data: **${jiraStories.map(s => s.key).join(', ')}**\n`);
+      } else if (keys.length > 0) {
+        stream.markdown(`🔍 Detected Jira keys (from cache): **${keys.join(', ')}**\n`);
+      }
+    } else {
+      // No cache — detect keys and fetch from Jira
+      const detectedKeys: string[] = jiraOverrides.length > 0
+        ? jiraOverrides
+        : detectJiraKeys(prData);
 
-    if (detectedKeys.length > 0) {
-      stream.markdown(`🔍 Detected Jira keys: **${detectedKeys.join(', ')}**\n`);
-    }
+      if (detectedKeys.length > 0) {
+        stream.markdown(`🔍 Detected Jira keys: **${detectedKeys.join(', ')}**\n`);
+      }
 
-    const jiraCreds = await jiraStore.get();
+      const jiraCreds = await jiraStore.get();
 
-    if (jiraCreds && detectedKeys.length > 0) {
-      stream.markdown(`🎫 Fetching ${detectedKeys.length} Jira stor${detectedKeys.length > 1 ? 'ies' : 'y'}: **${detectedKeys.join(', ')}**…\n`);
-      jiraStories = await fetchJiraStories(detectedKeys, jiraCreds, stream);
-      jiraStories.forEach(s => {
-        stream.markdown(
-          `✅ **[${s.key}]** ${s.summary}  _(${s.type} · ${s.status} · 📅 ${s.sprint})_` +
-          (s.acceptanceCriteria ? '  📋 AC found' : '') + '\n'
-        );
-      });
-    } else if (!jiraCreds && detectedKeys.length > 0) {
-      stream.markdown(`ℹ️ Jira keys detected but no credentials saved — keys will be listed in the Excel.\nRun \`@code-review /jira your@email.com TOKEN\` to enable full story fetch.\n`);
-    } else if (detectedKeys.length === 0) {
-      stream.markdown(`ℹ️ No Jira ticket detected in branch, title, or PR description.\nUse \`--jira SRM2-XXXX SRM2-YYYY\` to specify manually.\n`);
-    }
+      if (jiraCreds && detectedKeys.length > 0) {
+        stream.markdown(`🎫 Fetching ${detectedKeys.length} Jira stor${detectedKeys.length > 1 ? 'ies' : 'y'}: **${detectedKeys.join(', ')}**…\n`);
+        jiraStories = await fetchJiraStories(detectedKeys, jiraCreds, stream);
+        jiraStories.forEach(s => {
+          stream.markdown(
+            `✅ **[${s.key}]** ${s.summary}  _(${s.type} · ${s.status} · 📅 ${s.sprint})_` +
+            (s.acceptanceCriteria ? '  📋 AC found' : '') + '\n'
+          );
+        });
+      } else if (!jiraCreds && detectedKeys.length > 0) {
+        stream.markdown(`ℹ️ Jira keys detected but no credentials saved — keys will be listed in the Excel.\nRun \`@code-review /jira your@email.com TOKEN\` to enable full story fetch.\n`);
+      } else if (detectedKeys.length === 0) {
+        stream.markdown(`ℹ️ No Jira ticket detected in branch, title, or PR description.\nUse \`--jira SRM2-XXXX SRM2-YYYY\` to specify manually.\n`);
+      }
+
+      // Save result to detectedKeys for use in generateExcel below
+      cachedDetectedKeys = detectedKeys;
+    } // end Jira section
+
+    // Resolve final detectedKeys for Excel (from cache or freshly fetched)
+    const detectedKeys: string[] = cachedDetectedKeys ?? [];
 
     // ── AI analysis ────────────────────────────────────────────────────────
     stream.markdown(`\n🤖 Analysing code diff + comments against all 25 checklist rows…\n`);
