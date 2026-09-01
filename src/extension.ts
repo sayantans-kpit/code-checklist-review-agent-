@@ -1574,7 +1574,8 @@ export function activate(context: vscode.ExtensionContext) {
   ) => {
 
     // ── /help ─────────────────────────────────────────────────────────────
-    if (request.command === 'help' || !request.prompt.trim()) {
+    // Show help when explicitly asked, or when no command AND no prompt
+    if (request.command === 'help' || (!request.command && !request.prompt.trim())) {
       stream.markdown(HELP_TEXT);
       return;
     }
