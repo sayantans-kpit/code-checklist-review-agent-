@@ -887,6 +887,230 @@ class IndexStore {
 //   fresh minimal OOXML parts; the workbook manifest and content-type registry
 //   are updated accordingly.
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Fix applicator — applies AI-generated code fix + test update to workspace files
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Maps a source file path to its likely test file path using project conventions */
+function findTestFilePath(sourcePath: string): string[] {
+  const candidates: string[] = [];
+  const base = sourcePath.replace(/\\/g, '/');
+
+  // Ruby on Rails conventions
+  if (base.match(/app\/(models|controllers|services|helpers|mailers|jobs|workers)\//)) {
+    candidates.push(base.replace(/^app\//, 'spec/').replace(/\.rb$/, '_spec.rb'));
+    candidates.push(base.replace(/^app\//, 'test/').replace(/\.rb$/, '_test.rb'));
+  }
+
+  // React / JavaScript conventions
+  if (base.match(/\.(js|ts|jsx|tsx)$/)) {
+    const dir  = base.substring(0, base.lastIndexOf('/'));
+    const file = base.substring(base.lastIndexOf('/') + 1);
+    const stem = file.replace(/\.(js|ts|jsx|tsx)$/, '');
+    const ext  = file.match(/\.(js|ts|jsx|tsx)$/)?.[1] ?? 'js';
+
+    candidates.push(`${dir}/__tests__/${stem}.test.${ext}`);
+    candidates.push(`${dir}/${stem}.test.${ext}`);
+    candidates.push(`${dir}/${stem}.spec.${ext}`);
+    candidates.push(base.replace(/app\/javascript\//, 'spec/javascript/').replace(/\.(js|ts|jsx|tsx)$/, `.test.$1`));
+  }
+
+  return candidates;
+}
+
+interface PreparedFix {
+  comment:  PRComment;
+  priority: '🔴 Latest review' | '🟡 Older';
+  summary:  string;
+  analysis: string;
+}
+
+/**
+ * Applies a fix to the source file and its test file.
+ * 1. Reads current file content
+ * 2. AI generates the exact updated file content
+ * 3. Finds related test file
+ * 4. AI generates updated test content
+ * 5. Shows diff for each — user confirms before applying
+ */
+async function applyFixToFile(
+  p: PreparedFix,
+  prData: PRData,
+  model: vscode.LanguageModelChat,
+  token: vscode.CancellationToken,
+  stream: vscode.ChatResponseStream
+): Promise<void> {
+
+  const filePath = p.comment.path!;
+  const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri;
+  if (!workspaceFolder) {
+    stream.markdown('⚠️ No workspace folder open.');
+    return;
+  }
+
+  // ── Find the file in workspace ───────────────────────────────────────────
+  const matches = await vscode.workspace.findFiles(`**/${filePath}`, '**/node_modules/**', 1);
+  if (matches.length === 0) {
+    stream.markdown(`⚠️ File not found in workspace: \`${filePath}\`\nShowing analysis only:\n\n${p.analysis}`);
+    return;
+  }
+
+  const sourceUri = matches[0];
+  const sourceDoc = await vscode.workspace.openTextDocument(sourceUri);
+  const currentContent = sourceDoc.getText();
+
+  stream.markdown(`📂 Found \`${filePath}\` — generating edit…`);
+
+  // ── AI generates the complete updated file ───────────────────────────────
+  const fixPrompt = `You are a senior engineer applying a code review fix.
+
+Reviewer comment: "${p.comment.body}"
+
+What needs to change: ${p.summary}
+
+CURRENT FILE CONTENT (${filePath}):
+\`\`\`
+${currentContent.slice(0, 6000)}${currentContent.length > 6000 ? '\n… [truncated]' : ''}
+\`\`\`
+
+ANALYSIS OF THE FIX:
+${p.analysis}
+
+Return ONLY the complete updated file content — no explanation, no markdown fences, no prefix text.
+The output must be the entire file, ready to save directly.`;
+
+  const msgs = [vscode.LanguageModelChatMessage.User(fixPrompt)];
+  const resp  = await model.sendRequest(msgs, {}, token);
+  let updatedContent = '';
+  for await (const chunk of resp.text) { updatedContent += chunk; }
+
+  // Strip any accidental code fences the model may add
+  updatedContent = updatedContent.replace(/^```[a-z]*\n?/m, '').replace(/\n?```\s*$/m, '').trim();
+
+  if (!updatedContent || updatedContent.length < 10) {
+    stream.markdown(`⚠️ AI did not return a valid file update. Showing analysis:\n\n${p.analysis}`);
+    return;
+  }
+
+  // ── Show diff and ask user to confirm the source file change ─────────────
+  const tmpSourceUri = vscode.Uri.parse(`untitled:PROPOSED — ${filePath}`);
+  const sourceEdit   = new vscode.WorkspaceEdit();
+  sourceEdit.createFile(tmpSourceUri, { ignoreIfExists: true, overwrite: true });
+  sourceEdit.insert(tmpSourceUri, new vscode.Position(0, 0), updatedContent);
+  await vscode.workspace.applyEdit(sourceEdit);
+
+  // Open diff: current (left) vs proposed (right)
+  await vscode.commands.executeCommand(
+    'vscode.diff',
+    sourceUri,
+    tmpSourceUri,
+    `${filePath} — Review fix (accept or reject)`
+  );
+
+  const applyChoice = await vscode.window.showQuickPick(
+    [
+      { label: '✅ Apply fix',   description: 'Write the proposed change to the file', value: 'apply'  },
+      { label: '❌ Reject',      description: 'Discard — keep original file',           value: 'reject' },
+    ],
+    { title: `Apply fix to ${filePath}?`, placeHolder: 'Review the diff above then decide' }
+  );
+
+  if ((applyChoice as any)?.value === 'apply') {
+    // Apply to the real file
+    const realEdit = new vscode.WorkspaceEdit();
+    realEdit.replace(sourceUri, new vscode.Range(0, 0, sourceDoc.lineCount, 0), updatedContent);
+    await vscode.workspace.applyEdit(realEdit);
+    stream.markdown(`✅ Fix applied to \`${filePath}\``);
+
+    // ── Find and update test file ──────────────────────────────────────────
+    const testCandidates = findTestFilePath(filePath);
+    let testUri: vscode.Uri | null = null;
+
+    for (const candidate of testCandidates) {
+      const found = await vscode.workspace.findFiles(`**/${candidate}`, '**/node_modules/**', 1);
+      if (found.length > 0) { testUri = found[0]; break; }
+    }
+
+    if (testUri) {
+      stream.markdown(`🧪 Found test file — generating test update…`);
+      const testDoc     = await vscode.workspace.openTextDocument(testUri);
+      const testContent = testDoc.getText();
+
+      const testPrompt = `You are updating a test file after a code change.
+
+Source file changed: ${filePath}
+Test file: ${testUri.fsPath.split('/').slice(-3).join('/')}
+
+ORIGINAL source code (relevant section):
+\`\`\`
+${currentContent.slice(0, 3000)}
+\`\`\`
+
+UPDATED source code:
+\`\`\`
+${updatedContent.slice(0, 3000)}
+\`\`\`
+
+CURRENT TEST FILE:
+\`\`\`
+${testContent.slice(0, 4000)}
+\`\`\`
+
+Return ONLY the complete updated test file content.
+Update only tests affected by the code change. Do not remove unrelated tests.`;
+
+      const testMsgs = [vscode.LanguageModelChatMessage.User(testPrompt)];
+      const testResp  = await model.sendRequest(testMsgs, {}, token);
+      let updatedTest = '';
+      for await (const chunk of testResp.text) { updatedTest += chunk; }
+      updatedTest = updatedTest.replace(/^```[a-z]*\n?/m, '').replace(/\n?```\s*$/m, '').trim();
+
+      if (updatedTest && updatedTest.length > 10) {
+        const tmpTestUri = vscode.Uri.parse(`untitled:PROPOSED — ${testUri.fsPath.split('/').pop()}`);
+        const testPreviewEdit = new vscode.WorkspaceEdit();
+        testPreviewEdit.createFile(tmpTestUri, { ignoreIfExists: true, overwrite: true });
+        testPreviewEdit.insert(tmpTestUri, new vscode.Position(0, 0), updatedTest);
+        await vscode.workspace.applyEdit(testPreviewEdit);
+
+        await vscode.commands.executeCommand('vscode.diff', testUri, tmpTestUri,
+          `Test update — ${testUri.fsPath.split('/').pop()} (review and apply)`);
+
+        const testChoice = await vscode.window.showQuickPick(
+          [
+            { label: '✅ Apply test update', description: 'Write updated tests to file', value: 'apply'  },
+            { label: '❌ Skip',              description: 'Keep original tests',          value: 'skip'   },
+          ],
+          { title: 'Apply test file update?', placeHolder: 'Review the test diff above' }
+        );
+
+        if ((testChoice as any)?.value === 'apply') {
+          const realTestEdit = new vscode.WorkspaceEdit();
+          realTestEdit.replace(testUri, new vscode.Range(0, 0, testDoc.lineCount, 0), updatedTest);
+          await vscode.workspace.applyEdit(realTestEdit);
+          stream.markdown(`🧪 Test file updated: \`${testUri.fsPath.split('/').slice(-2).join('/')}\``);
+        } else {
+          stream.markdown(`⏭️ Test file skipped — update manually if needed.`);
+        }
+      }
+    } else {
+      stream.markdown([
+        `⚠️ No test file found for \`${filePath}\``,
+        `Expected one of:\n${testCandidates.map(c => `- \`${c}\``).join('\n')}`,
+        `Consider adding tests for the changed code.`,
+      ].join('\n'));
+    }
+
+    // Show PR reply comment
+    const replyMatch = p.analysis.match(/## 💬 PR reply comment\s*([\s\S]+?)(?=\n##|$)/);
+    if (replyMatch) {
+      stream.markdown(`\n**💬 PR reply to post:**\n> ${replyMatch[1].trim()}`);
+    }
+
+  } else {
+    stream.markdown(`❌ Fix rejected — original file unchanged.`);
+  }
+}
+
 async function generateExcel(
   prData: PRData,
   findings: RowFinding[],
@@ -1808,13 +2032,6 @@ export function activate(context: vscode.ExtensionContext) {
       // Each comment is analysed and its fix is stored — user never sees this
       stream.markdown(`🔍 Analysing **${allComments.length}** comment(s) silently…`);
 
-      interface PreparedFix {
-        comment:  PRComment;
-        priority: '🔴 Latest review' | '🟡 Older';
-        summary:  string;   // one-line AI summary for the question
-        analysis: string;   // full AI analysis shown only if user picks "Fix this"
-      }
-
       const prepared: PreparedFix[] = [];
 
       for (const c of allComments) {
@@ -1904,7 +2121,14 @@ SUMMARY: <one sentence — what change is needed>
 
         if (action === 'fix') {
           fixed++;
-          stream.markdown(`\n✅ **Fix this** selected:\n\n${p.analysis}`);
+          stream.markdown(`\n✅ Working on the fix…`);
+
+          if (p.comment.path) {
+            await applyFixToFile(p, prData, model!, token, stream);
+          } else {
+            // Conversation comment — no file to patch, just show analysis
+            stream.markdown(`\n${p.analysis}`);
+          }
         } else if (action === 'defer') {
           deferred++;
           stream.markdown(`\n⏰ **Deferred** — you can come back to this.`);
