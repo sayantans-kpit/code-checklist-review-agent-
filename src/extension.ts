@@ -115,10 +115,25 @@ interface FilePatch {
   patch: string;           // the raw unified diff for this file (may be truncated)
 }
 
+/** A single structured PR comment — inline or conversation thread */
+interface PRComment {
+  id:          number;
+  author:      string;
+  body:        string;
+  createdAt:   string;
+  // Inline code comment fields (null for general conversation comments)
+  path:        string | null;   // file path
+  line:        number | null;   // line number in the diff
+  diffHunk:    string | null;   // the diff context around the comment
+  // Resolution / review state
+  resolved:    boolean;         // true if the thread is resolved
+  reviewState: string | null;   // 'APPROVED' | 'CHANGES_REQUESTED' | 'COMMENTED' | null
+}
+
 interface PRData {
   url: string;
   title: string;
-  body: string;            // PR description — used to extract Jira links
+  body: string;
   author: string;
   assignees: string[];
   reviewers: string[];
@@ -126,7 +141,8 @@ interface PRData {
   baseBranch: string;
   createdAt: string | null;
   closedAt:  string | null;
-  comments: string[];
+  comments: string[];            // flat text array — used for AI analysis
+  richComments: PRComment[];     // structured — used for /fix-review
   files: FilePatch[];
   diffSummary: string;
 }
@@ -308,9 +324,71 @@ async function fetchFromGitHub(prUrl: string, token: string): Promise<PRData> {
     createdAt: pr.created_at ?? null,
     closedAt:  pr.merged_at ?? (pr.state === 'closed' ? pr.closed_at : null) ?? null,
     comments,
+    richComments: buildRichComments(reviews, inlines, issueComments),
     files,
     diffSummary,
   };
+}
+
+/** Build structured PRComment list from all raw GitHub API responses */
+function buildRichComments(
+  reviews:       any[],
+  inlines:       any[],
+  issueComments: any[]
+): PRComment[] {
+  const result: PRComment[] = [];
+
+  // Review-level comments (summary body + state)
+  for (const r of reviews) {
+    if (!r.body?.trim()) { continue; }
+    result.push({
+      id:          r.id,
+      author:      r.user?.login ?? '',
+      body:        r.body.trim(),
+      createdAt:   r.submitted_at ?? '',
+      path:        null,
+      line:        null,
+      diffHunk:    null,
+      resolved:    false,   // review summaries don't have a resolved flag
+      reviewState: r.state ?? null,
+    });
+  }
+
+  // Inline code comments — these are the most actionable ones
+  // GitHub marks a thread as resolved via the in_reply_to_id chain; approximate
+  // by treating any comment without in_reply_to_id as the thread root
+  const rootInlines = inlines.filter((c: any) => !c.in_reply_to_id);
+  for (const c of rootInlines) {
+    result.push({
+      id:          c.id,
+      author:      c.user?.login ?? '',
+      body:        c.body?.trim() ?? '',
+      createdAt:   c.created_at ?? '',
+      path:        c.path ?? null,
+      line:        c.line ?? c.original_line ?? null,
+      diffHunk:    c.diff_hunk ? c.diff_hunk.split('\n').slice(-6).join('\n') : null,
+      resolved:    false,   // we can't tell from REST API alone; treated as unresolved
+      reviewState: null,
+    });
+  }
+
+  // General conversation comments
+  for (const c of issueComments) {
+    if (!c.body?.trim()) { continue; }
+    result.push({
+      id:          c.id,
+      author:      c.user?.login ?? '',
+      body:        c.body.trim(),
+      createdAt:   c.created_at ?? '',
+      path:        null,
+      line:        null,
+      diffHunk:    null,
+      resolved:    false,
+      reviewState: null,
+    });
+  }
+
+  return result;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1623,6 +1701,130 @@ export function activate(context: vscode.ExtensionContext) {
       return;
     }
 
+    // ── /fix-review — walk through unresolved PR comments + Not Ok checklist rows ──
+    if (request.command === 'fix-review') {
+      const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.env.HOME ?? '/tmp';
+
+      // Load from session cache
+      const cached = sessionCache.load();
+      if (!cached) {
+        stream.markdown([
+          '⚠️ No PR loaded in this session.\n',
+          'First run: `@code-review <PR_URL>` to load a PR, then call `/fix-review`',
+        ].join('\n'));
+        return;
+      }
+
+      const { prData, jiraStories } = cached;
+
+      // Collect unresolved inline + conversation comments
+      // Filter out: bot approvals, short reactions ("LGTM", "+1"), already-resolved
+      const unresolvedComments = prData.richComments.filter(c => {
+        if (c.resolved) { return false; }
+        if (c.reviewState === 'APPROVED') { return false; }
+        // Skip very short non-actionable comments
+        const bodyClean = c.body.replace(/[+\-\s\d]/g, '').toLowerCase();
+        if (bodyClean.length < 10) { return false; }
+        // Skip Copilot suggestion headers (just "Suggestion" with no body)
+        if (c.body.trim() === 'Suggestion') { return false; }
+        return true;
+      });
+
+      // Load Not Ok findings from context file
+      const ctxPath = path.join(workspaceRoot, 'code-review', '.context.md');
+      const ctxText = fs.existsSync(ctxPath) ? fs.readFileSync(ctxPath, 'utf8') : '';
+      const notOkSection = ctxText.match(/## Code Fix Tasks[\s\S]*?(?=^##|\Z)/m)?.[0] ?? '';
+      const hasChecklist = notOkSection.length > 0;
+
+      if (unresolvedComments.length === 0 && !hasChecklist) {
+        stream.markdown('✅ No unresolved PR comments and no Not Ok checklist rows found. Looking clean!');
+        return;
+      }
+
+      stream.markdown([
+        `## 🔧 Fix Review`,
+        ``,
+        `Found **${unresolvedComments.length}** unresolved PR comment(s)` +
+          (hasChecklist ? ` + Not Ok checklist rows` : '') + `.\n`,
+        `I'll walk through each one — explaining what the reviewer wants, brainstorming the fix, and giving you a reply comment.\n`,
+        `---`,
+      ].join('\n'));
+
+      // Get AI model
+      let model: vscode.LanguageModelChat | undefined;
+      for (const family of ['claude-sonnet', 'gpt-4o', 'gpt-4', 'default']) {
+        const candidates = await vscode.lm.selectChatModels({ family });
+        if (candidates.length) { model = candidates[0]; break; }
+      }
+      if (!model) { const all = await vscode.lm.selectChatModels({}); model = all[0]; }
+      if (!model) { stream.markdown('⚠️ No AI model available.'); return; }
+
+      let fixNum = 0;
+      const total = unresolvedComments.length + (hasChecklist ? 1 : 0);
+
+      // ── Process each unresolved PR comment ─────────────────────────────
+      for (const comment of unresolvedComments) {
+        fixNum++;
+        const location = comment.path
+          ? `\`${comment.path}${comment.line ? `:${comment.line}` : ''}\``
+          : `General conversation`;
+
+        stream.markdown(`\n---\n### ${fixNum}/${total} — ${location}\n`);
+        stream.markdown(`**By:** ${comment.author}  ·  ${new Date(comment.createdAt).toLocaleDateString()}\n`);
+        stream.markdown(`> ${comment.body.replace(/\n/g, '\n> ')}\n`);
+
+        if (comment.diffHunk) {
+          stream.markdown(`**Code context:**\n\`\`\`diff\n${comment.diffHunk}\n\`\`\`\n`);
+        }
+
+        // AI: explain + fix + reply
+        const prompt = `You are a senior software engineer helping a developer respond to a code review comment.
+
+PR: ${prData.title} (${prData.url})
+File: ${comment.path ?? 'general conversation'}${comment.line ? ` line ${comment.line}` : ''}
+Reviewer (${comment.author}) said:
+"${comment.body}"
+
+${comment.diffHunk ? `Code context:\n\`\`\`diff\n${comment.diffHunk}\n\`\`\`` : ''}
+
+${jiraStories.length ? `Jira stories: ${jiraStories.map((s: any) => `[${s.key}] ${s.summary}`).join(', ')}` : ''}
+
+Provide a structured response with these EXACT sections:
+
+## 🧠 What the reviewer wants
+(1-2 sentences explaining the concern in plain English)
+
+## 💡 Proposed fix
+(The actual code change needed — show as a diff or code snippet if applicable)
+
+## 💬 PR reply comment
+(A short, professional comment to post back on the PR thread — max 3 sentences)`;
+
+        const messages = [vscode.LanguageModelChatMessage.User(prompt)];
+        const response = await model.sendRequest(messages, {}, token);
+        for await (const chunk of response.text) { stream.markdown(chunk); }
+      }
+
+      // ── Process Not Ok checklist rows (summary) ─────────────────────────
+      if (hasChecklist) {
+        fixNum++;
+        stream.markdown(`\n---\n### ${fixNum}/${total} — Checklist Not Ok rows\n`);
+        stream.markdown(notOkSection.replace(/^## Code Fix Tasks[^\n]*\n/, ''));
+      }
+
+      stream.markdown([
+        `\n---`,
+        `## ✅ All ${total} item(s) reviewed`,
+        ``,
+        `**Next steps:**`,
+        `- Apply the fixes above to the codebase`,
+        `- Copy the 💬 PR reply comments and post them on each thread`,
+        `- Once fixes are pushed, run \`@code-review /generate\` to update the checklist`,
+      ].join('\n'));
+
+      return;
+    }
+
     // ── /history — show all versions for a PR ─────────────────────────────
     if (request.command === 'history') {
       const prKey = request.prompt.trim();
@@ -2007,6 +2209,7 @@ export function activate(context: vscode.ExtensionContext) {
         createdAt:   null,
         closedAt:    null,
         comments:    pastedComments,
+        richComments: [],
         files:       localFiles,
         diffSummary: localFiles.map(f => `  ${f.filename}  (+${f.additions}/-${f.deletions})`).join('\n'),
       };
@@ -2040,6 +2243,7 @@ export function activate(context: vscode.ExtensionContext) {
         createdAt: null,
         closedAt:  null,
         comments: pastedComments,
+        richComments: [],
         files: [],
         diffSummary: '',
       };

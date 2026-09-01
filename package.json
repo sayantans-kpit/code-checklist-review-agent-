@@ -2,7 +2,7 @@
   "name": "code-review-checklist-agent",
   "displayName": "Code Review Checklist Agent",
   "description": "PSSM2.0 Code Review Checklist Agent — conversational AI that generates, analyses and tracks code review checklists from GitHub PRs and Jira stories",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -46,6 +46,10 @@
           {
             "name": "list",
             "description": "Batch mode: resolve Jira keys/PR URLs and generate checklists. Usage: @code-review /generate --list SRM2-1234 SRM2-5678 https://github.com/org/repo/pull/42"
+          },
+          {
+            "name": "fix-review",
+            "description": "Walk through every unresolved PR comment + Not Ok checklist row with AI-powered fix suggestions and PR reply comments"
           }
         ]
       }
