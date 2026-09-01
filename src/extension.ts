@@ -1754,23 +1754,19 @@ export function activate(context: vscode.ExtensionContext) {
       return;
     }
 
-    // ── /fix-review — walk through unresolved PR comments + Not Ok checklist rows ──
+    // ── /fix-review — interactive review comment resolution ──────────────────
     if (request.command === 'fix-review') {
       const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.env.HOME ?? '/tmp';
 
-      // Load from session cache
       const cached = sessionCache.load();
       if (!cached) {
-        stream.markdown([
-          '⚠️ No PR loaded in this session.\n',
-          'First run: `@code-review <PR_URL>` to load a PR, then call `/fix-review`',
-        ].join('\n'));
+        stream.markdown('⚠️ No PR loaded.\nRun: `@code-review <PR_URL>` first.');
         return;
       }
 
       const { prData, jiraStories } = cached;
 
-      // ── Find latest CHANGES_REQUESTED review timestamp ───────────────────
+      // ── Build comment list (same two-group logic, no output yet) ─────────
       const reviewComments = prData.richComments.filter(c => c.reviewState !== null);
       const latestChangesReq = reviewComments
         .filter(c => c.reviewState === 'CHANGES_REQUESTED')
@@ -1778,58 +1774,28 @@ export function activate(context: vscode.ExtensionContext) {
       const cutoffTime = latestChangesReq
         ? new Date(latestChangesReq.createdAt).getTime() : 0;
 
-      // ── Basic noise filter (applies to all comments) ──────────────────────
       function isActionable(c: PRComment): boolean {
+        if (c.resolved) { return false; }
         if (c.reviewState === 'APPROVED') { return false; }
-        if (c.body.trim() === 'Suggestion') { return false; }
         if (c.author === prData.author && !c.reviewState) { return false; }
-        const clean = c.body.replace(/[+\-\s\d!.,]/g, '').toLowerCase();
-        return clean.length >= 10;
+        if (c.body.trim() === 'Suggestion') { return false; }
+        return c.body.replace(/[+\-\s\d!.,]/g, '').toLowerCase().length >= 10;
       }
 
-      // ── Group 1: latest review cycle (priority) ───────────────────────────
-      const latestCycleComments = prData.richComments.filter(c => {
-        if (!isActionable(c)) { return false; }
-        if (c.resolved) { return false; }
-        return cutoffTime > 0
-          ? new Date(c.createdAt).getTime() >= cutoffTime
-          : true;
-      });
+      const latestCycle = prData.richComments.filter(c =>
+        isActionable(c) && (cutoffTime === 0 || new Date(c.createdAt).getTime() >= cutoffTime)
+      );
+      const older = prData.richComments.filter(c =>
+        isActionable(c) && cutoffTime > 0 && new Date(c.createdAt).getTime() < cutoffTime
+      );
+      const allComments = [...latestCycle, ...older];
 
-      // ── Group 2: older unresolved comments (catch anything missed) ────────
-      const olderComments = prData.richComments.filter(c => {
-        if (!isActionable(c)) { return false; }
-        if (c.resolved) { return false; }
-        // Only those older than the latest review cycle
-        if (cutoffTime === 0) { return false; }
-        return new Date(c.createdAt).getTime() < cutoffTime;
-      });
-
-      // Load Not Ok findings from context file
-      const ctxPath = path.join(workspaceRoot, 'code-review', '.context.md');
-      const ctxText = fs.existsSync(ctxPath) ? fs.readFileSync(ctxPath, 'utf8') : '';
-      const notOkSection = ctxText.match(/## Code Fix Tasks[\s\S]*?(?=^##|\Z)/m)?.[0] ?? '';
-      const hasChecklist = notOkSection.length > 0;
-
-      if (latestCycleComments.length === 0 && olderComments.length === 0 && !hasChecklist) {
-        stream.markdown('✅ No pending review comments found. Looking clean!');
+      if (allComments.length === 0) {
+        stream.markdown('✅ No pending review comments found.');
         return;
       }
 
-      stream.markdown([
-        `## 🔧 Fix Review`,
-        ``,
-        latestChangesReq
-          ? `📅 Latest review by **${latestChangesReq.author}** on ${new Date(latestChangesReq.createdAt).toLocaleDateString()}`
-          : '',
-        `- 🔴 **${latestCycleComments.length}** comment(s) from the latest review cycle ← priority`,
-        olderComments.length > 0 ? `- 🟡 **${olderComments.length}** older comment(s) to also check` : '',
-        ``,
-        `I'll walk through each one — explain the concern, propose a fix, and give you a PR reply.\n`,
-        `---`,
-      ].filter(Boolean).join('\n'));
-
-      // Get AI model
+      // ── Get AI model silently ─────────────────────────────────────────────
       let model: vscode.LanguageModelChat | undefined;
       for (const family of ['claude-sonnet', 'gpt-4o', 'gpt-4', 'default']) {
         const candidates = await vscode.lm.selectChatModels({ family });
@@ -1838,85 +1804,127 @@ export function activate(context: vscode.ExtensionContext) {
       if (!model) { const all = await vscode.lm.selectChatModels({}); model = all[0]; }
       if (!model) { stream.markdown('⚠️ No AI model available.'); return; }
 
-      let fixNum = 0;
-      const allToProcess = [...latestCycleComments, ...olderComments];
-      const total = allToProcess.length + (hasChecklist ? 1 : 0);
+      // ── Pre-analyse ALL comments silently in background ───────────────────
+      // Each comment is analysed and its fix is stored — user never sees this
+      stream.markdown(`🔍 Analysing **${allComments.length}** comment(s) silently…`);
 
-      // ── Helper: process one comment through AI ────────────────────────────
-      async function processComment(comment: PRComment, label: string): Promise<void> {
-        fixNum++;
-        const location = comment.path
-          ? `\`${comment.path}${comment.line ? `:${comment.line}` : ''}\``
-          : `General conversation`;
+      interface PreparedFix {
+        comment:  PRComment;
+        priority: '🔴 Latest review' | '🟡 Older';
+        summary:  string;   // one-line AI summary for the question
+        analysis: string;   // full AI analysis shown only if user picks "Fix this"
+      }
 
-        stream.markdown(`\n---\n### ${fixNum}/${total} ${label} — ${location}\n`);
-        stream.markdown(`**By:** ${comment.author}  ·  ${new Date(comment.createdAt).toLocaleDateString()}\n`);
-        stream.markdown(`> ${comment.body.replace(/\n/g, '\n> ')}\n`);
+      const prepared: PreparedFix[] = [];
 
-        if (comment.diffHunk) {
-          stream.markdown(`**Code context:**\n\`\`\`diff\n${comment.diffHunk}\n\`\`\`\n`);
-        }
+      for (const c of allComments) {
+        const isLatest = latestCycle.includes(c);
+        const location = c.path ? `${c.path}${c.line ? `:${c.line}` : ''}` : 'conversation';
 
-        const prompt = `You are a senior software engineer helping a developer respond to a code review comment.
+        // Single AI call per comment — produces summary + full analysis
+        const analysisPrompt = `You are a senior engineer analysing a code review comment.
 
-PR: ${prData.title} (${prData.url})
-File: ${comment.path ?? 'general conversation'}${comment.line ? ` line ${comment.line}` : ''}
-Reviewer (${comment.author}) said:
-"${comment.body}"
+PR: ${prData.title}
+Location: ${location}
+Reviewer (${c.author}): "${c.body}"
+${c.diffHunk ? `\nCode context:\n\`\`\`diff\n${c.diffHunk}\n\`\`\`` : ''}
+${jiraStories.length ? `\nJira: ${jiraStories.map((s: any) => `[${s.key}] ${s.summary}`).join(', ')}` : ''}
 
-${comment.diffHunk ? `Code context:\n\`\`\`diff\n${comment.diffHunk}\n\`\`\`` : ''}
-
-${jiraStories.length ? `Jira stories: ${jiraStories.map((s: any) => `[${s.key}] ${s.summary}`).join(', ')}` : ''}
-
-Provide a structured response with these EXACT sections:
-
+Respond with EXACTLY this format (no extra text):
+SUMMARY: <one sentence — what change is needed>
+---ANALYSIS---
 ## 🧠 What the reviewer wants
-(1-2 sentences explaining the concern in plain English)
+<1-2 sentences>
 
 ## 💡 Proposed fix
-(The actual code change needed — show as a diff or code snippet if applicable)
+<code diff or snippet>
 
 ## 💬 PR reply comment
-(A short, professional comment to post back on the PR thread — max 3 sentences)`;
+<2-3 sentence reply to paste on the PR thread>`;
 
-        const messages = [vscode.LanguageModelChatMessage.User(prompt)];
-        const response = await model!.sendRequest(messages, {}, token);
-        for await (const chunk of response.text) { stream.markdown(chunk); }
-      }
+        try {
+          const msgs = [vscode.LanguageModelChatMessage.User(analysisPrompt)];
+          const resp = await model.sendRequest(msgs, {}, token);
+          let raw = '';
+          for await (const chunk of resp.text) { raw += chunk; }
 
-      // ── Process latest cycle first (priority) ─────────────────────────────
-      if (latestCycleComments.length > 0) {
-        stream.markdown(`\n## 🔴 Latest Review Cycle — ${latestCycleComments.length} comment(s)\n`);
-        for (const c of latestCycleComments) {
-          await processComment(c, '🔴');
+          const summaryMatch = raw.match(/^SUMMARY:\s*(.+)/m);
+          const analysisMatch = raw.match(/---ANALYSIS---\s*([\s\S]+)/);
+
+          prepared.push({
+            comment:  c,
+            priority: isLatest ? '🔴 Latest review' : '🟡 Older',
+            summary:  summaryMatch?.[1]?.trim() ?? c.body.slice(0, 80),
+            analysis: analysisMatch?.[1]?.trim() ?? raw,
+          });
+        } catch {
+          prepared.push({
+            comment:  c,
+            priority: isLatest ? '🔴 Latest review' : '🟡 Older',
+            summary:  c.body.slice(0, 80),
+            analysis: '_(Analysis unavailable — try again)_',
+          });
         }
       }
 
-      // ── Process older comments (catch-up) ────────────────────────────────
-      if (olderComments.length > 0) {
-        stream.markdown(`\n## 🟡 Older Unresolved Comments — ${olderComments.length} comment(s)\n`);
-        stream.markdown(`_These predate the latest review cycle. Check if they were actually addressed._\n`);
-        for (const c of olderComments) {
-          await processComment(c, '🟡');
+      // ── Present each comment interactively ────────────────────────────────
+      stream.markdown(`\n## 🔧 Fix Review — ${prepared.length} pending comment(s)\n`);
+      stream.markdown(`For each comment, choose what to do:\n`);
+
+      let fixed = 0, deferred = 0, skipped = 0;
+
+      for (let i = 0; i < prepared.length; i++) {
+        const p = prepared[i];
+        const location = p.comment.path
+          ? `\`${p.comment.path}${p.comment.line ? `:${p.comment.line}` : ''}\``
+          : `conversation`;
+
+        // Show the comment as a question — clean, no analysis dump
+        stream.markdown([
+          `\n---`,
+          `### ${i + 1}/${prepared.length}  ${p.priority}`,
+          `**${p.comment.author}** on ${location}:`,
+          `> ${p.comment.body.split('\n')[0].slice(0, 120)}${p.comment.body.length > 120 ? '…' : ''}`,
+          ``,
+          `**What's needed:** ${p.summary}`,
+        ].join('\n'));
+
+        // Quick-pick: user decides action
+        const choice = await vscode.window.showQuickPick(
+          [
+            { label: '$(tools) Fix this',    description: 'Show the fix + PR reply comment', value: 'fix'   },
+            { label: '$(clock) Defer',       description: 'Skip for now, handle later',      value: 'defer' },
+            { label: '$(x) Won\'t fix',      description: 'Intentional — skip with note',    value: 'skip'  },
+          ],
+          { title: `Comment ${i + 1}/${prepared.length} — ${p.comment.author} on ${p.comment.path ?? 'conversation'}`,
+            placeHolder: 'What do you want to do with this comment?' }
+        );
+
+        const action = (choice as any)?.value ?? 'defer';
+
+        if (action === 'fix') {
+          fixed++;
+          stream.markdown(`\n✅ **Fix this** selected:\n\n${p.analysis}`);
+        } else if (action === 'defer') {
+          deferred++;
+          stream.markdown(`\n⏰ **Deferred** — you can come back to this.`);
+        } else {
+          skipped++;
+          stream.markdown(`\n❌ **Won't fix** — noted.`);
         }
       }
 
-      // ── Not Ok checklist rows ─────────────────────────────────────────────
-      if (hasChecklist) {
-        fixNum++;
-        stream.markdown(`\n---\n### ${fixNum}/${total} — Checklist Not Ok rows\n`);
-        stream.markdown(notOkSection.replace(/^## Code Fix Tasks[^\n]*\n/, ''));
-      }
-
+      // ── Summary ───────────────────────────────────────────────────────────
       stream.markdown([
         `\n---`,
-        `## ✅ All ${total} item(s) reviewed`,
+        `## ✅ Done — ${prepared.length} comment(s) reviewed`,
+        `- ✅ Fix this: **${fixed}**`,
+        `- ⏰ Deferred: **${deferred}**`,
+        `- ❌ Won't fix: **${skipped}**`,
         ``,
-        `**Next steps:**`,
-        `- Apply the fixes above`,
-        `- Paste the 💬 reply comments on each PR thread`,
-        `- Push → run \`@code-review /generate\` to update the checklist`,
-      ].join('\n'));
+        deferred > 0 ? `Run \`@code-review /fix-review\` again to work on the deferred ones.` : '',
+        `After applying fixes → \`@code-review /generate\` to update the checklist.`,
+      ].filter(Boolean).join('\n'));
 
       return;
     }
