@@ -269,10 +269,62 @@ async function fetchFromGitHub(prUrl: string, token: string): Promise<PRData> {
 
   // Paginated comment fetches — all pages, no 100-item cap
   const [reviews, inlines, issueComments] = await Promise.all([
-    fetchAllPages(`${base}/pulls/${number}/reviews`,   headers),   // review summaries
-    fetchAllPages(`${base}/pulls/${number}/comments`,  headers),   // inline code comments
-    fetchAllPages(`${base}/issues/${number}/comments`, headers),   // full conversation thread
+    fetchAllPages(`${base}/pulls/${number}/reviews`,   headers),
+    fetchAllPages(`${base}/pulls/${number}/comments`,  headers),
+    fetchAllPages(`${base}/issues/${number}/comments`, headers),
   ]);
+
+  // ── Fetch thread resolution status via GraphQL ────────────────────────────
+  // The REST API does not expose isResolved on inline comment threads.
+  // GraphQL does. We use it to get the set of resolved thread IDs.
+  const resolvedThreadIds = new Set<number>();
+  try {
+    const graphqlQuery = `{
+      repository(owner: "${owner}", name: "${repo}") {
+        pullRequest(number: ${number}) {
+          reviewThreads(first: 100) {
+            nodes {
+              isResolved
+              comments(first: 1) { nodes { databaseId } }
+            }
+          }
+        }
+      }
+    }`;
+    const gqlRes = await httpsGet('https://api.github.com/graphql', {
+      ...headers,
+      'Content-Type': 'application/json',
+    });
+    // httpsGet is GET-only; use a raw https POST for GraphQL
+    const gqlResponse = await new Promise<any>((resolve, reject) => {
+      const https = require('https') as typeof import('https');
+      const body  = JSON.stringify({ query: graphqlQuery });
+      const req   = https.request(
+        { hostname: 'api.github.com', path: '/graphql', method: 'POST',
+          headers: { ...headers, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+          timeout: 10000 },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on('data', (c: Buffer) => chunks.push(c));
+          res.on('end', () => resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))));
+        }
+      );
+      req.on('error', reject);
+      req.on('timeout', () => { req.destroy(); reject(new Error('GraphQL timeout')); });
+      req.write(body);
+      req.end();
+    });
+
+    const threads = gqlResponse?.data?.repository?.pullRequest?.reviewThreads?.nodes ?? [];
+    for (const thread of threads) {
+      if (thread.isResolved) {
+        const firstCommentId = thread.comments?.nodes?.[0]?.databaseId;
+        if (firstCommentId) { resolvedThreadIds.add(firstCommentId); }
+      }
+    }
+  } catch {
+    // GraphQL fetch failed — fall back to REST-only (no resolution info)
+  }
 
   const pr           = await prRes.json() as any;
   const rawFiles     = filesRes.ok        ? (await filesRes.json() as any[]) : [];
@@ -324,7 +376,7 @@ async function fetchFromGitHub(prUrl: string, token: string): Promise<PRData> {
     createdAt: pr.created_at ?? null,
     closedAt:  pr.merged_at ?? (pr.state === 'closed' ? pr.closed_at : null) ?? null,
     comments,
-    richComments: buildRichComments(reviews, inlines, issueComments),
+    richComments: buildRichComments(reviews, inlines, issueComments, resolvedThreadIds),
     files,
     diffSummary,
   };
@@ -332,9 +384,10 @@ async function fetchFromGitHub(prUrl: string, token: string): Promise<PRData> {
 
 /** Build structured PRComment list from all raw GitHub API responses */
 function buildRichComments(
-  reviews:       any[],
-  inlines:       any[],
-  issueComments: any[]
+  reviews:            any[],
+  inlines:            any[],
+  issueComments:      any[],
+  resolvedThreadIds:  Set<number>   // from GraphQL — definitive resolution status
 ): PRComment[] {
   const result: PRComment[] = [];
 
@@ -349,14 +402,13 @@ function buildRichComments(
       path:        null,
       line:        null,
       diffHunk:    null,
-      resolved:    false,   // review summaries don't have a resolved flag
+      resolved:    false,
       reviewState: r.state ?? null,
     });
   }
 
-  // Inline code comments — these are the most actionable ones
-  // GitHub marks a thread as resolved via the in_reply_to_id chain; approximate
-  // by treating any comment without in_reply_to_id as the thread root
+  // Inline code comments — only thread roots (no in_reply_to_id)
+  // Mark resolved using the GraphQL result (definitive) or fall back to false
   const rootInlines = inlines.filter((c: any) => !c.in_reply_to_id);
   for (const c of rootInlines) {
     result.push({
@@ -367,7 +419,7 @@ function buildRichComments(
       path:        c.path ?? null,
       line:        c.line ?? c.original_line ?? null,
       diffHunk:    c.diff_hunk ? c.diff_hunk.split('\n').slice(-6).join('\n') : null,
-      resolved:    false,   // we can't tell from REST API alone; treated as unresolved
+      resolved:    resolvedThreadIds.has(c.id),   // ← definitive from GraphQL
       reviewState: null,
     });
   }
@@ -1718,63 +1770,39 @@ export function activate(context: vscode.ExtensionContext) {
 
       const { prData, jiraStories } = cached;
 
-      // ── Find the latest review cycle start time ───────────────────────────
-      // Strategy: find the most recent "CHANGES_REQUESTED" review.
-      // Only process comments created AFTER that review — these are the ones
-      // the reviewer left in their latest pass that still need attention.
-      // If no CHANGES_REQUESTED exists, fall back to the latest review of any kind.
+      // ── Find latest CHANGES_REQUESTED review timestamp ───────────────────
       const reviewComments = prData.richComments.filter(c => c.reviewState !== null);
-      const changesRequestedReviews = reviewComments
+      const latestChangesReq = reviewComments
         .filter(c => c.reviewState === 'CHANGES_REQUESTED')
-        .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())[0];
+      const cutoffTime = latestChangesReq
+        ? new Date(latestChangesReq.createdAt).getTime() : 0;
 
-      const latestReview = changesRequestedReviews[0]
-        ?? reviewComments.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())[0];
-
-      const cutoffTime = latestReview
-        ? new Date(latestReview.createdAt).getTime()
-        : 0;   // no cutoff — show all if no reviews found
-
-      // ── Build set of author's own comment IDs (replies = likely addressed) ─
-      // If the PR author replied to an inline thread root, treat it as addressed
-      const authorRepliedToIds = new Set<number>();
-      for (const c of prData.richComments) {
-        if (c.author === prData.author && c.path !== null) {
-          // This is an author inline reply — mark it as addressed
-          // We can't get in_reply_to_id from richComments directly, so we use
-          // proximity: author inline comments on the same file+line = addressed
-          prData.richComments
-            .filter(other => other.path === c.path && other.line === c.line && other.author !== prData.author)
-            .forEach(other => authorRepliedToIds.add(other.id));
-        }
+      // ── Basic noise filter (applies to all comments) ──────────────────────
+      function isActionable(c: PRComment): boolean {
+        if (c.reviewState === 'APPROVED') { return false; }
+        if (c.body.trim() === 'Suggestion') { return false; }
+        if (c.author === prData.author && !c.reviewState) { return false; }
+        const clean = c.body.replace(/[+\-\s\d!.,]/g, '').toLowerCase();
+        return clean.length >= 10;
       }
 
-      // ── Filter to only actionable comments from the latest review cycle ───
-      const unresolvedComments = prData.richComments.filter(c => {
-        // Must be from the latest review cycle or later
-        const commentTime = new Date(c.createdAt).getTime();
-        if (cutoffTime > 0 && commentTime < cutoffTime) { return false; }
-
-        // Skip if PR author has already replied (likely addressed)
-        if (authorRepliedToIds.has(c.id)) { return false; }
-
-        // Skip resolved threads
+      // ── Group 1: latest review cycle (priority) ───────────────────────────
+      const latestCycleComments = prData.richComments.filter(c => {
+        if (!isActionable(c)) { return false; }
         if (c.resolved) { return false; }
+        return cutoffTime > 0
+          ? new Date(c.createdAt).getTime() >= cutoffTime
+          : true;
+      });
 
-        // Skip approvals
-        if (c.reviewState === 'APPROVED') { return false; }
-
-        // Skip non-actionable short comments (LGTM, +1, thumbs up, etc.)
-        const bodyClean = c.body.replace(/[+\-\s\d!.,]/g, '').toLowerCase();
-        if (bodyClean.length < 10) { return false; }
-
-        // Skip Copilot auto-suggestion placeholders
-        if (c.body.trim() === 'Suggestion') { return false; }
-
-        // Skip the PR author's own comments (they wrote them, not to-do for them)
-        if (c.author === prData.author && !c.reviewState) { return false; }
-
-        return true;
+      // ── Group 2: older unresolved comments (catch anything missed) ────────
+      const olderComments = prData.richComments.filter(c => {
+        if (!isActionable(c)) { return false; }
+        if (c.resolved) { return false; }
+        // Only those older than the latest review cycle
+        if (cutoffTime === 0) { return false; }
+        return new Date(c.createdAt).getTime() < cutoffTime;
       });
 
       // Load Not Ok findings from context file
@@ -1783,23 +1811,23 @@ export function activate(context: vscode.ExtensionContext) {
       const notOkSection = ctxText.match(/## Code Fix Tasks[\s\S]*?(?=^##|\Z)/m)?.[0] ?? '';
       const hasChecklist = notOkSection.length > 0;
 
-      if (unresolvedComments.length === 0 && !hasChecklist) {
-        stream.markdown('✅ No pending reviewer comments from the latest review cycle. Looking clean!');
+      if (latestCycleComments.length === 0 && olderComments.length === 0 && !hasChecklist) {
+        stream.markdown('✅ No pending review comments found. Looking clean!');
         return;
       }
-
-      const cycleLabel = latestReview
-        ? `latest review by **${latestReview.author}** on ${new Date(latestReview.createdAt).toLocaleDateString()}`
-        : 'all comments';
 
       stream.markdown([
         `## 🔧 Fix Review`,
         ``,
-        `📅 Showing comments from the **${cycleLabel}** (${unresolvedComments.length} actionable).`,
-        latestReview ? `_(Older comments and already-replied threads are skipped)_\n` : '',
-        `I'll walk through each one — explaining what the reviewer wants, brainstorming the fix, and giving you a reply comment.\n`,
+        latestChangesReq
+          ? `📅 Latest review by **${latestChangesReq.author}** on ${new Date(latestChangesReq.createdAt).toLocaleDateString()}`
+          : '',
+        `- 🔴 **${latestCycleComments.length}** comment(s) from the latest review cycle ← priority`,
+        olderComments.length > 0 ? `- 🟡 **${olderComments.length}** older comment(s) to also check` : '',
+        ``,
+        `I'll walk through each one — explain the concern, propose a fix, and give you a PR reply.\n`,
         `---`,
-      ].join('\n'));
+      ].filter(Boolean).join('\n'));
 
       // Get AI model
       let model: vscode.LanguageModelChat | undefined;
@@ -1811,16 +1839,17 @@ export function activate(context: vscode.ExtensionContext) {
       if (!model) { stream.markdown('⚠️ No AI model available.'); return; }
 
       let fixNum = 0;
-      const total = unresolvedComments.length + (hasChecklist ? 1 : 0);
+      const allToProcess = [...latestCycleComments, ...olderComments];
+      const total = allToProcess.length + (hasChecklist ? 1 : 0);
 
-      // ── Process each unresolved PR comment ─────────────────────────────
-      for (const comment of unresolvedComments) {
+      // ── Helper: process one comment through AI ────────────────────────────
+      async function processComment(comment: PRComment, label: string): Promise<void> {
         fixNum++;
         const location = comment.path
           ? `\`${comment.path}${comment.line ? `:${comment.line}` : ''}\``
           : `General conversation`;
 
-        stream.markdown(`\n---\n### ${fixNum}/${total} — ${location}\n`);
+        stream.markdown(`\n---\n### ${fixNum}/${total} ${label} — ${location}\n`);
         stream.markdown(`**By:** ${comment.author}  ·  ${new Date(comment.createdAt).toLocaleDateString()}\n`);
         stream.markdown(`> ${comment.body.replace(/\n/g, '\n> ')}\n`);
 
@@ -1828,7 +1857,6 @@ export function activate(context: vscode.ExtensionContext) {
           stream.markdown(`**Code context:**\n\`\`\`diff\n${comment.diffHunk}\n\`\`\`\n`);
         }
 
-        // AI: explain + fix + reply
         const prompt = `You are a senior software engineer helping a developer respond to a code review comment.
 
 PR: ${prData.title} (${prData.url})
@@ -1852,11 +1880,28 @@ Provide a structured response with these EXACT sections:
 (A short, professional comment to post back on the PR thread — max 3 sentences)`;
 
         const messages = [vscode.LanguageModelChatMessage.User(prompt)];
-        const response = await model.sendRequest(messages, {}, token);
+        const response = await model!.sendRequest(messages, {}, token);
         for await (const chunk of response.text) { stream.markdown(chunk); }
       }
 
-      // ── Process Not Ok checklist rows (summary) ─────────────────────────
+      // ── Process latest cycle first (priority) ─────────────────────────────
+      if (latestCycleComments.length > 0) {
+        stream.markdown(`\n## 🔴 Latest Review Cycle — ${latestCycleComments.length} comment(s)\n`);
+        for (const c of latestCycleComments) {
+          await processComment(c, '🔴');
+        }
+      }
+
+      // ── Process older comments (catch-up) ────────────────────────────────
+      if (olderComments.length > 0) {
+        stream.markdown(`\n## 🟡 Older Unresolved Comments — ${olderComments.length} comment(s)\n`);
+        stream.markdown(`_These predate the latest review cycle. Check if they were actually addressed._\n`);
+        for (const c of olderComments) {
+          await processComment(c, '🟡');
+        }
+      }
+
+      // ── Not Ok checklist rows ─────────────────────────────────────────────
       if (hasChecklist) {
         fixNum++;
         stream.markdown(`\n---\n### ${fixNum}/${total} — Checklist Not Ok rows\n`);
@@ -1868,9 +1913,9 @@ Provide a structured response with these EXACT sections:
         `## ✅ All ${total} item(s) reviewed`,
         ``,
         `**Next steps:**`,
-        `- Apply the fixes above to the codebase`,
-        `- Copy the 💬 PR reply comments and post them on each thread`,
-        `- Once fixes are pushed, run \`@code-review /generate\` to update the checklist`,
+        `- Apply the fixes above`,
+        `- Paste the 💬 reply comments on each PR thread`,
+        `- Push → run \`@code-review /generate\` to update the checklist`,
       ].join('\n'));
 
       return;
