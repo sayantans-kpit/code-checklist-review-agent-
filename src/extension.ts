@@ -1718,16 +1718,62 @@ export function activate(context: vscode.ExtensionContext) {
 
       const { prData, jiraStories } = cached;
 
-      // Collect unresolved inline + conversation comments
-      // Filter out: bot approvals, short reactions ("LGTM", "+1"), already-resolved
+      // ── Find the latest review cycle start time ───────────────────────────
+      // Strategy: find the most recent "CHANGES_REQUESTED" review.
+      // Only process comments created AFTER that review — these are the ones
+      // the reviewer left in their latest pass that still need attention.
+      // If no CHANGES_REQUESTED exists, fall back to the latest review of any kind.
+      const reviewComments = prData.richComments.filter(c => c.reviewState !== null);
+      const changesRequestedReviews = reviewComments
+        .filter(c => c.reviewState === 'CHANGES_REQUESTED')
+        .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+
+      const latestReview = changesRequestedReviews[0]
+        ?? reviewComments.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())[0];
+
+      const cutoffTime = latestReview
+        ? new Date(latestReview.createdAt).getTime()
+        : 0;   // no cutoff — show all if no reviews found
+
+      // ── Build set of author's own comment IDs (replies = likely addressed) ─
+      // If the PR author replied to an inline thread root, treat it as addressed
+      const authorRepliedToIds = new Set<number>();
+      for (const c of prData.richComments) {
+        if (c.author === prData.author && c.path !== null) {
+          // This is an author inline reply — mark it as addressed
+          // We can't get in_reply_to_id from richComments directly, so we use
+          // proximity: author inline comments on the same file+line = addressed
+          prData.richComments
+            .filter(other => other.path === c.path && other.line === c.line && other.author !== prData.author)
+            .forEach(other => authorRepliedToIds.add(other.id));
+        }
+      }
+
+      // ── Filter to only actionable comments from the latest review cycle ───
       const unresolvedComments = prData.richComments.filter(c => {
+        // Must be from the latest review cycle or later
+        const commentTime = new Date(c.createdAt).getTime();
+        if (cutoffTime > 0 && commentTime < cutoffTime) { return false; }
+
+        // Skip if PR author has already replied (likely addressed)
+        if (authorRepliedToIds.has(c.id)) { return false; }
+
+        // Skip resolved threads
         if (c.resolved) { return false; }
+
+        // Skip approvals
         if (c.reviewState === 'APPROVED') { return false; }
-        // Skip very short non-actionable comments
-        const bodyClean = c.body.replace(/[+\-\s\d]/g, '').toLowerCase();
+
+        // Skip non-actionable short comments (LGTM, +1, thumbs up, etc.)
+        const bodyClean = c.body.replace(/[+\-\s\d!.,]/g, '').toLowerCase();
         if (bodyClean.length < 10) { return false; }
-        // Skip Copilot suggestion headers (just "Suggestion" with no body)
+
+        // Skip Copilot auto-suggestion placeholders
         if (c.body.trim() === 'Suggestion') { return false; }
+
+        // Skip the PR author's own comments (they wrote them, not to-do for them)
+        if (c.author === prData.author && !c.reviewState) { return false; }
+
         return true;
       });
 
@@ -1738,15 +1784,19 @@ export function activate(context: vscode.ExtensionContext) {
       const hasChecklist = notOkSection.length > 0;
 
       if (unresolvedComments.length === 0 && !hasChecklist) {
-        stream.markdown('✅ No unresolved PR comments and no Not Ok checklist rows found. Looking clean!');
+        stream.markdown('✅ No pending reviewer comments from the latest review cycle. Looking clean!');
         return;
       }
+
+      const cycleLabel = latestReview
+        ? `latest review by **${latestReview.author}** on ${new Date(latestReview.createdAt).toLocaleDateString()}`
+        : 'all comments';
 
       stream.markdown([
         `## 🔧 Fix Review`,
         ``,
-        `Found **${unresolvedComments.length}** unresolved PR comment(s)` +
-          (hasChecklist ? ` + Not Ok checklist rows` : '') + `.\n`,
+        `📅 Showing comments from the **${cycleLabel}** (${unresolvedComments.length} actionable).`,
+        latestReview ? `_(Older comments and already-replied threads are skipped)_\n` : '',
         `I'll walk through each one — explaining what the reviewer wants, brainstorming the fix, and giving you a reply comment.\n`,
         `---`,
       ].join('\n'));
